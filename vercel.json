@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "src/app/api/run/route.ts": { "maxDuration": 300 },
+    "src/app/api/export/route.ts": { "maxDuration": 120 },
+    "src/app/api/domains/route.ts": { "maxDuration": 60 }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [{ "key": "Authorization", "value": "" }]
+    }
+  ]
+}
