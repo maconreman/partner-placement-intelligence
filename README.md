@@ -1,22 +1,21 @@
-# Nexus Placement Intelligence — Alpha M8
+---
+title: Nexus Placement Intelligence
+emoji: 🎯
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
+# Nexus Placement Intelligence — Alpha M7
 
 Single-deployment FastAPI + Next.js app that scores content-placement opportunities
-across the FFG network. **M8** fixes the weekly-snapshot accumulation bug in the
-BigQuery read path (a scheduled sync would have silently inflated click and
-impression totals from its second run onward), makes the sync idempotent
-(delete-partition-before-insert + a single-flight lock), replaces the Step 1
-vertical accordion with non-hiding selector chips, moves the domain lists
-(EXCLUDED_DOMAINS, CLIENT_VERTICAL_MAP) into ops-editable JSON files under
-`backend/data/` with a fail-closed loader, and restores the missing root
-`layout.tsx`. It builds on M7's Hugging Face Spaces (Docker) migration, login
-gate, and BigQuery write-path hardening. The pipeline, scoring (70/30), and the
-locked output schema are unchanged.
-
-> **Deployment note:** pushing to `main` auto-deploys to the Hugging Face Space
-> via `.github/workflows` (force-push sync). Merging to `main` IS deploying.
-> The legacy **Alpha M6 Vercel deployment is intentionally kept alive** for its
-> remaining users on a pinned branch (`vercel-m6-stable`) — do not point Vercel
-> at `main`, and do not delete that branch. See M8_CHANGES.md.
+across the FFG network. **M7** migrates the production stack to Hugging Face Spaces
+(Docker), replaces the old Basic Auth popup with a styled username/password gate,
+hardens the BigQuery write path so GSC data actually persists, and ships a UI
+refresh with a dark/light toggle. It builds on M4's single-app consolidation and
+cold-run speed work. The partnerships-team experience is unchanged in shape.
 
 ```
 nexus-placement-intelligence/
@@ -25,14 +24,13 @@ nexus-placement-intelligence/
 │   ├── lib/            pipeline, gsc, crawl, classify, rank, tokenstore, gate, …
 │   └── routers/        gate, auth, domains, run, export, feedback, admin
 ├── frontend/           Next.js static export
-│   └── src/app/        layout.tsx · page.tsx (tool) · login/ · setup/ · admin/
+│   └── src/app/        page.tsx (tool) · login/ · setup/ · admin/
 ├── Dockerfile          builds frontend → serves everything from FastAPI :7860
-├── backend/data/       ops-editable JSON: client_verticals, excluded_domains
 ├── DECISIONS.md        binding architectural decisions — read first
 └── .env.example
 ```
 
-See `M8_CHANGES.md` for exactly what changed and why, and `DECISIONS.md` for the
+See `M7_CHANGES.md` for exactly what changed and why, and `DECISIONS.md` for the
 binding rule set.
 
 ---
