@@ -118,14 +118,17 @@ a { color: var(--teal-600); }
 .brand-sub { font-size: 11px; color: var(--muted); letter-spacing: 0.01em; margin-top: 2px; }
 .topbar-spacer { flex: 1; }
 .topbar-status { font-size: 12px; font-weight: 500; color: var(--success); padding-left: 10px; border-left: 2px solid var(--success); }
-/* M9.2: email attribution in the top bar. Truncates gracefully on narrow
-   viewports; hidden below the mobile breakpoint (see @media 720px below). */
-.topbar-attribution { font-size: 12px; color: var(--muted); text-decoration: none; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.topbar-attribution:hover { color: var(--teal-600); text-decoration: underline; }
 
 /* Shell */
 .shell { max-width: 1160px; margin: 0 auto; padding: 40px 28px 96px; }
 .page-head { margin-bottom: 30px; }
+/* M9.3: opt-in row layout for a page head that carries a contextual action.
+   Applied as a MODIFIER (.page-head.page-head-row) rather than changing
+   .page-head itself, because /admin and /setup also use .page-head with a bare
+   h1 + p and would have their title and lead laid out side by side. */
+.page-head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.page-head-text { min-width: 0; }
+.page-head-action { flex: none; margin-top: 4px; white-space: nowrap; }
 .page-head h1 { font-family: var(--display); font-weight: 700; font-size: 30px; line-height: 1.1; letter-spacing: -0.025em; margin: 0 0 8px; color: var(--ink); }
 .page-head .lead { color: var(--ink-soft); margin: 0; font-size: 15px; max-width: 60ch; }
 
@@ -290,9 +293,9 @@ tr.row-open { background: var(--surface-2); }
 
 /* Results meta + show-all */
 .results-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 0 4px; }
-/* M9.2: run completion timestamp + duration. */
+/* M9.3: run completion stamp, e.g. "Completed 2:30 PM · 3m 12s". */
 .results-timestamp { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
-.run-completed { font-family: var(--mono); color: var(--ink-soft); margin-left: 10px; font-size: 12px; }
+.results-timestamp b { color: var(--ink-soft); font-weight: 500; }
 
 /* M9.2: preview-overlap fix. Long titles, URLs, and matched fragments used to
    push the Page and Matched-on cells wider than the table, overlapping adjacent
@@ -341,9 +344,9 @@ tr.row-open { background: var(--surface-2); }
   .shell { padding: 28px 18px 72px; }
   .tracker { grid-template-columns: repeat(4, 1fr); }
   .page-head h1 { font-size: 25px; }
-  /* M9.2: the top bar is tight on mobile; drop the attribution there. It stays
-     available in the footer-less desktop bar and via the app's About/README. */
-  .topbar-attribution { display: none; }
+  /* M9.3: stack the title and its action rather than squeezing them side by side. */
+  .page-head-row { flex-direction: column; align-items: stretch; gap: 14px; }
+  .page-head-action { margin-top: 0; align-self: flex-start; }
 }
 
 /* ============================================================================
