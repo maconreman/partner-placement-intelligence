@@ -6,7 +6,10 @@ Hard rules preserved:
 """
 from __future__ import annotations
 import re
-from .config import NLP_SHORTLIST_CAP, _DOMAIN_GENERICS
+from .config import (
+    NLP_SHORTLIST_CAP, _DOMAIN_GENERICS,
+    NON_PLACEMENT_CATEGORIES, NON_PLACEMENT_URL_PATTERNS,
+)
 from .util import PageRow, CandidateRow, LogFn, url_path
 
 GENERIC_TOKENS = {
@@ -73,6 +76,24 @@ def _surface_value(p: PageRow, surface: str) -> str:
     return ""
 
 
+def _is_non_placement(p: PageRow) -> bool:
+    """
+    True when a page is never a valid placement and must not reach the results.
+
+    M9.2: the single authoritative exclusion, driven by config so the rule lives
+    in one declared place. Drops pages by category (Hub, Homepage, Contact) and
+    by archive/taxonomy URL (/category/, /tag/, ...). Programmatic series pages
+    are NOT excluded here — they remain valid placements (D8).
+    """
+    if p.page_category in NON_PLACEMENT_CATEGORIES:
+        return True
+    try:
+        path = url_path(p.page)
+    except Exception:
+        path = ""
+    return any(pat in path for pat in NON_PLACEMENT_URL_PATTERNS)
+
+
 def quick_match_candidates(
     pages: list[PageRow],
     raw_topic: str,
@@ -82,8 +103,14 @@ def quick_match_candidates(
     if not pages:
         return []
 
-    # Exclude Hub pages; Programmatic pages stay (D4/D8)
-    working = [p for p in pages if p.page_category != "Hub"]
+    # M9.2: exclude non-placements (Hub, Homepage, Contact, and /category//tag/
+    # archive URLs) at this single choke point, so they can never reach the
+    # ranked list regardless of how they were categorized. Programmatic series
+    # pages stay (D4/D8). This replaces the prior Hub-only filter.
+    excluded = sum(1 for p in pages if _is_non_placement(p))
+    working = [p for p in pages if not _is_non_placement(p)]
+    if excluded:
+        log(f"Excluded {excluded} non-placement pages (homepage, contact, hub, category/tag archives).")
     if not working:
         return []
 
