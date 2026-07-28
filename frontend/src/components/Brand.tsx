@@ -67,20 +67,17 @@ export function ThemeToggle() {
   );
 }
 
-export interface NavAction {
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-}
-
+// M9.3: TopBar is permanent site chrome only. It no longer takes a navAction:
+// a step-specific button that appeared and disappeared inside the global header
+// read as unfinished, because site identity and page-specific actions were
+// sharing one strip. Contextual actions ("New run", "Back to domains") now live
+// beside the page title, which is where a normal site puts them.
 export function TopBar({
   connected,
   showSetupLink = true,
-  navAction,
 }: {
   connected?: boolean;
   showSetupLink?: boolean;
-  navAction?: NavAction;
 }) {
   return (
     <div className="topbar">
@@ -95,19 +92,6 @@ export function TopBar({
           </div>
         </a>
         <div className="topbar-spacer" />
-        {/* M9.2: attribution shown in the app UI. */}
-        <a
-          className="topbar-attribution"
-          href="mailto:macon.reman@nexusmarketing.com"
-          title="Maintained by Macon Reman"
-        >
-          macon.reman@nexusmarketing.com
-        </a>
-        {navAction && (
-          <button className="ghost tiny" onClick={navAction.onClick} disabled={navAction.disabled}>
-            {navAction.label}
-          </button>
-        )}
         {connected && <span className="topbar-status">Connected</span>}
         {showSetupLink && (
           <a href="/setup"><button className="ghost tiny">Account setup</button></a>
