@@ -22,9 +22,19 @@ leaving only infinitegiving.com. Per-domain writes make a domain durable as soon
 as it is scanned and make a partial run incapable of touching domains it did not
 fetch. The end-of-run sync_to_bigquery() call is kept as a reconciliation pass
 that carries the complete result set.
+
+M9.3 fix (D-M9-14): _domain_account_map is a ContextVar, not a module global.
+It was shared by every concurrent request in the process, and
+list_gsc_properties() cleared and rebuilt it across `await` points, so two
+overlapping users could interleave and query the wrong Google account for a
+domain. _live_gsc_fetch() now also populates the mapping for its own request,
+because the map is consumed in a different HTTP request (/api/run) from the one
+that used to fill it (/api/domains); a per-context variable is not inherited
+across requests.
 """
 from __future__ import annotations
 import asyncio
+from contextvars import ContextVar
 from datetime import date, timedelta
 from typing import Optional, Callable
 
@@ -38,12 +48,57 @@ from .tokenstore import get_auth_status
 # pipeline can overlap metadata crawling with the fetch of later domains.
 OnDomainComplete = Callable[[str, list], None]
 
-# Domain → account key mapping, populated by list_gsc_properties().
-_domain_account_map: dict[str, str] = {}
+# ── Domain → account key mapping (M9.3: ContextVar, was a module global) ──────
+# FastAPI runs concurrent requests as interleaved coroutines in ONE process, so
+# a plain module-level dict here is shared by every user at once.
+# list_gsc_properties() cleared and rebuilt that dict with `await` points in
+# between, so two overlapping runs could interleave: _account_for_domain() would
+# then return another user's mapping, or fall back to "data" for a domain owned
+# by analytics@. That is not a crash, it is a silently wrong Google account
+# being queried, which is worse.
+#
+# A ContextVar is per-context. asyncio copies the current context when a Task is
+# created, so a value set before `map_with_concurrency` fans out is visible to
+# every child task of THAT request, and invisible to other requests.
+#
+# default is None, never a mutable default: `default={}` would be one dict
+# shared by every context, which is exactly the bug being removed. Always .set()
+# a freshly built dict, never mutate the stored one in place.
+_domain_account_map: ContextVar[Optional[dict[str, str]]] = ContextVar(
+    "gsc_domain_account_map", default=None
+)
 
 
 def _account_for_domain(domain: str) -> str:
-    return _domain_account_map.get(domain, "data")
+    current = _domain_account_map.get()
+    return (current or {}).get(domain, "data")
+
+
+async def _ensure_domain_account_map(log: LogFn = print) -> None:
+    """
+    Make sure THIS request/context has a domain to account mapping.
+
+    Required because the map is consumed in a different HTTP request from the
+    one that populates it: GET /api/domains calls list_gsc_properties(), while
+    POST /api/run consumes the mapping later, during the fetch. With a module
+    global that cross-request coupling happened to work, and was the source of
+    the cross-user race. With a per-context ContextVar every request starts
+    empty, so the fetch path has to populate its own map. Without this, every
+    domain would silently fall back to the "data" account and analytics@-owned
+    properties would return no data.
+
+    Building it here also removes the latent ordering dependency: a run no
+    longer requires that /api/domains was called first in the same process.
+
+    Best-effort. A failure is logged, and _account_for_domain() falls back to
+    "data", which is the same behavior as before this function existed.
+    """
+    if _domain_account_map.get():
+        return
+    try:
+        await list_gsc_properties(log)
+    except Exception as e:
+        log(f"Could not resolve the domain to account mapping: {e}")
 
 
 async def list_gsc_properties(log: LogFn = print) -> dict:
@@ -73,11 +128,16 @@ async def list_gsc_properties(log: LogFn = print) -> dict:
             log(f"{account}: could not list GSC properties. {e}")
             props_by_account[account] = []
 
-    _domain_account_map.clear()
-    ffg_set = set(FFG_OWNED_DOMAINS)
+    # M9.3: build a NEW dict and .set() it into this context. The old code did
+    # _domain_account_map.clear() then filled it in place, which mutated state
+    # shared by every concurrent request. Never mutate the stored dict.
+    new_map: dict[str, str] = {}
     for account, domains in props_by_account.items():
         for d in domains:
-            _domain_account_map[d] = account
+            new_map[d] = account
+    _domain_account_map.set(new_map)
+
+    ffg_set = set(FFG_OWNED_DOMAINS)
 
     all_domains: set[str] = set()
     for domains in props_by_account.values():
@@ -252,6 +312,13 @@ async def _live_gsc_fetch(
     on_domain_complete: "OnDomainComplete | None" = None,
 ) -> list[GscRow]:
     # ── Live GSC fetch ────────────────────────────────────────────────────────
+    # M9.3: resolve this request's domain to account mapping first. Every
+    # _account_for_domain() call below depends on it, and with a per-context
+    # ContextVar the mapping is not inherited from the earlier /api/domains
+    # request. No-op when the context already has one (the admin path calls
+    # list_gsc_properties() itself before fetching).
+    await _ensure_domain_account_map(log)
+
     # M4 item 2: as each domain's rows finish, fire on_domain_complete(domain, rows)
     # so the pipeline can begin crawling that domain's pages while later domains
     # are still being fetched. The callback is best-effort and never blocks or
