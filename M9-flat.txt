@@ -1,0 +1,717 @@
+===============================================================================
+NEXUS PLACEMENT INTELLIGENCE — M9-flat.txt
+Ingestion plane moved off the app (free). Relocation milestone: no scoring,
+schema, dedup, or output changes. Every M8 rule still holds.
+===============================================================================
+
+HARD RULES CARRIED INTO M9 (do not violate):
+  - Output schema: Page URL | Page Category | Topical Relevance Score | SEO Score
+  - Weights 70/30; composite score computed BEFORE dedup (D2)
+  - No TF-IDF fallback, ever (D1)
+  - Weekly-snapshot write via WRITE_TRUNCATE load job into table$YYYYMMDD (D-M8-1)
+  - D11 scoped to streaming inserts only; load jobs take ISO strings (D-M8-2)
+
+M9 RULES (this milestone):
+  - D-M9-1 Ingestion runs on a scheduled runner, not inside the app
+  - D-M9-2 AUTO_SYNC_SECRET + /api/admin/auto-sync retired (do not schedule it)
+  - D-M9-3 Manual admin sync buttons kept as a gated fallback
+  - D-M9-4 CI runs strict: BQ_STRICT_WRITES=true fails a silent write
+  - D-M9-5 Keep-alive is a mitigation with an expiry (delete on warm instance)
+  - DEFERRED to M9.1: incremental delta fetch (schema-contract change, own spec)
+
+TABLE OF CONTENTS:
+  jobs/__init__.py
+  jobs/sync.py
+  .github/workflows/warehouse-sync.yml
+  .github/workflows/keepalive.yml
+  M9_DECISIONS.md
+  M9_CHANGES.md
+  M9_HANDOFF.md
+===============================================================================
+
+
+===============================================================================
+=== jobs/__init__.py ===
+
+"""Standalone job entrypoints that run outside the FastAPI app (Alpha M9)."""
+
+
+===============================================================================
+=== jobs/sync.py ===
+
+"""
+jobs/sync.py — Standalone warehouse-sync entrypoint (Alpha M9).
+
+Runs the full ingestion pipeline OUTSIDE the web app, in a plain Python process.
+This is the same Phase 1 (live GSC fetch) + Phase 2 (metadata crawl) logic that
+`routers/admin.py::auto_sync` runs in a fire-and-forget background task on the
+Space, lifted into a script so it can run on a GitHub Actions runner instead.
+
+Why this exists (M9 core change):
+  - The Space's ingestion path had three structural problems that no amount of
+    concurrency tuning fixes: it slept after ~48h idle, it inherited the request
+    lifetime it was launched from, and it was triggered by an unauthenticated
+    secret-in-URL cron endpoint on a public app. Moving ingestion to a scheduled
+    runner removes all three at once.
+  - Tokens live in Upstash and BigQuery credentials come from an env var, so a
+    runner with the same secrets can do everything the app can. No app is
+    involved in a sync anymore.
+
+What this deliberately does NOT change:
+  - The GSC fetch, the 70/30 scoring, the composite-before-dedup rule, the locked
+    output schema, and the weekly-snapshot write model are all untouched. This is
+    a relocation of *where* ingestion runs, not a change to *what* it computes.
+  - Incremental delta fetch (7 days instead of 365) is M9.1 and needs its own
+    schema spec — it changes GscRow's shape. It is not in this job.
+
+Run locally:
+    python -m jobs.sync
+
+Run one phase only:
+    python -m jobs.sync --phase gsc
+    python -m jobs.sync --phase metadata
+
+Exit code is non-zero on failure so a CI runner marks the job red.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from datetime import date, timedelta
+
+# ── Env bootstrap (mirrors main.py D14: env must be present before any backend
+# import, because backend.lib.config reads env vars and loads data files at
+# import time). On a runner the env comes from Actions secrets; locally we try a
+# .env for developer convenience. python-dotenv is optional — absence is fine.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+
+def _log(msg: str) -> None:
+    """Stdout is captured verbatim by the Actions runner log."""
+    print(msg, flush=True)
+
+
+def _date_range() -> tuple[str, str]:
+    """Identical window to routers/admin.py: end = today - lag, start = -365d."""
+    from backend.lib.config import GSC_LAG_DAYS
+    end = date.today() - timedelta(days=GSC_LAG_DAYS)
+    start = end - timedelta(days=365)
+    return start.isoformat(), end.isoformat()
+
+
+async def _run_gsc_sync() -> int:
+    """Phase 1: live GSC fetch for every configured domain, persisted to BigQuery.
+
+    fetch_all_domains_live() writes freshly-fetched rows to BigQuery internally
+    (see gsc.py::_live_gsc_fetch), so there is no separate sync_to_bigquery call
+    here. Under M8's WRITE_TRUNCATE load job the write is idempotent anyway.
+    Returns the number of rows fetched.
+    """
+    from backend.lib.config import FFG_OWNED_DOMAINS, USE_BIGQUERY
+    from backend.lib.gsc import fetch_all_domains_live, list_gsc_properties
+
+    if not USE_BIGQUERY:
+        _log(
+            "BigQuery is not configured, so a sync would persist nothing. "
+            "Set BQ_PROJECT_ID, BQ_DATASET_ID and GCP_SERVICE_ACCOUNT_JSON."
+        )
+        raise SystemExit(2)
+
+    props = await list_gsc_properties(_log)
+    domains = props.get("ordered") or list(FFG_OWNED_DOMAINS)
+    start_date, end_date = _date_range()
+    _log(f"Date range: {start_date} to {end_date}")
+    _log(f"Domains: {len(domains)} properties")
+
+    _log("Fetching live GSC data from Search Console.")
+    rows = await fetch_all_domains_live(domains, start_date, end_date, _log)
+    if not rows:
+        _log(
+            "No GSC data returned. Confirm both Google accounts are connected at "
+            "/setup and that the service account has BigQuery Data Editor."
+        )
+        raise SystemExit(3)
+
+    _log(f"GSC sync complete: {len(rows):,} rows fetched and persisted.")
+    return len(rows)
+
+
+async def _run_metadata_sync() -> int:
+    """Phase 2: read the warehouse back, aggregate to pages, crawl metadata.
+
+    Depends on Phase 1 data existing in the warehouse. Returns the page count.
+    """
+    from backend.lib.config import FFG_OWNED_DOMAINS, USE_BIGQUERY
+    from backend.lib.gsc import list_gsc_properties
+    from backend.lib.bigquery import fetch_from_bigquery
+    from backend.lib.aggregate import aggregate_to_pages
+    from backend.lib.classify import (
+        enrich_page_categories, detect_hub_pages, detect_programmatic_series,
+    )
+    from backend.lib.crawl import crawl_metadata_for_pages
+
+    if not USE_BIGQUERY:
+        _log("BigQuery is not configured, so the metadata crawl cannot run.")
+        raise SystemExit(2)
+
+    start_date, end_date = _date_range()
+    props = await list_gsc_properties(_log)
+    domains = props.get("ordered") or list(FFG_OWNED_DOMAINS)
+
+    _log(f"Reading pages from the warehouse for {len(domains)} domains.")
+    rows, _fresh = await fetch_from_bigquery(domains, start_date, end_date, _log)
+    if not rows:
+        _log("The warehouse is empty. Run the GSC phase first.")
+        raise SystemExit(3)
+
+    _log(f"Aggregating {len(rows):,} GSC rows to unique pages.")
+    pages = aggregate_to_pages(rows)
+    pages = enrich_page_categories(pages, _log)
+    pages = detect_hub_pages(pages, _log)
+    pages = detect_programmatic_series(pages, _log)
+    _log(f"{len(pages):,} unique pages to crawl.")
+
+    await crawl_metadata_for_pages(pages, _log)
+    _log("Metadata sync complete.")
+    return len(pages)
+
+
+async def _run(phase: str) -> None:
+    if phase in ("gsc", "all"):
+        _log("=== Phase 1: GSC sync ===")
+        await _run_gsc_sync()
+    if phase in ("metadata", "all"):
+        _log("=== Phase 2: metadata crawl ===")
+        await _run_metadata_sync()
+    _log("Warehouse sync finished.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Nexus warehouse sync (M9).")
+    parser.add_argument(
+        "--phase",
+        choices=("all", "gsc", "metadata"),
+        default="all",
+        help="Which phase to run. Default runs GSC then metadata.",
+    )
+    args = parser.parse_args()
+
+    # Recommend strict writes on a runner: a silent BigQuery write failure should
+    # turn the job red, not pass quietly. The workflow sets BQ_STRICT_WRITES=true.
+    if os.environ.get("BQ_STRICT_WRITES", "").lower() not in ("1", "true", "yes"):
+        _log(
+            "Note: BQ_STRICT_WRITES is not set. A warehouse write failure will be "
+            "logged but will not fail this job. Set it to true on CI runners."
+        )
+
+    try:
+        asyncio.run(_run(args.phase))
+    except SystemExit:
+        raise
+    except Exception as exc:  # any unhandled error → red job
+        _log(f"FATAL: sync failed: {exc}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+===============================================================================
+=== .github/workflows/warehouse-sync.yml ===
+
+# Alpha M9 — warehouse sync on a schedule, off the app.
+#
+# This replaces the /api/admin/auto-sync/{secret} cron endpoint. Ingestion now
+# runs in a GitHub-hosted runner: no Space wake, no request timeout, no secret
+# in a URL. The runner has the same secrets the app has, and tokens live in
+# Upstash, so it can do the full sync on its own.
+#
+# Schedule: Mondays 04:00 UTC. Cron on GitHub Actions can start a few minutes
+# late under load, which is irrelevant for a weekly batch.
+#
+# You can also run it by hand from the Actions tab (workflow_dispatch), choosing
+# a phase. This is the manual "Sync GSC data" / "Sync page metadata" button from
+# the admin card, moved to a place that has no timeout ceiling.
+
+name: warehouse-sync
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Which phase to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - gsc
+          - metadata
+
+# One sync at a time. A manual run started during a scheduled run waits rather
+# than doubling GSC quota burn — the workflow-level equivalent of M8's
+# single-flight guard.
+concurrency:
+  group: warehouse-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Run warehouse sync
+        env:
+          # Fail the job on a silent warehouse write failure.
+          BQ_STRICT_WRITES: "true"
+
+          # Google OAuth app (same client the Space uses).
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          # APP_BASE_URL is only used to construct the OAuth redirect URI, which
+          # the sync path never calls. It must be set to satisfy _require_env;
+          # point it at the production Space URL.
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+
+          # Upstash Redis REST — where the GSC OAuth tokens are stored.
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
+          # BigQuery warehouse.
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+
+          # HF Inference token — used by the embedding path in scoring. Not
+          # strictly needed for a fetch+crawl sync, but harmless to provide.
+          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+
+          # Optional concurrency override. Leave unset to use the default of 16.
+          GSC_MAX_WORKERS: ${{ vars.GSC_MAX_WORKERS }}
+        run: |
+          python -m jobs.sync --phase "${{ github.event.inputs.phase || 'all' }}"
+
+
+===============================================================================
+=== .github/workflows/keepalive.yml ===
+
+# Alpha M9 — keep the Space awake, off third-party uptime monitors.
+#
+# The HF Space sleeps after ~48h idle. A cold wake is a slow first request but
+# not a failure. This pings a lightweight endpoint every 12h so the partnerships
+# team rarely meets a cold start. It replaces the UptimeRobot hack with a job
+# that is versioned, visible, and in the same place as everything else.
+#
+# This is a mitigation, not a fix. The permanent fix is a warm instance
+# (Cloud Run min-instances=1), which is deferred on budget. When that lands,
+# delete this workflow.
+
+name: keepalive
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the gate status endpoint
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          # /api/gate/status is open (no session cookie) and cheap. A non-2xx is
+          # tolerated: the point is to wake the Space, not to assert health.
+          curl --silent --show-error --max-time 60 \
+            "${APP_BASE_URL%/}/api/gate/status" || true
+
+
+===============================================================================
+=== M9_DECISIONS.md ===
+
+# Nexus Placement Intelligence — M9 Architectural Decisions
+
+Companion to `DECISIONS.md` and `M8_DECISIONS.md`. Binding for M9 and later.
+
+M9 is a relocation milestone. It moves *where* ingestion runs, not *what* it
+computes. No scoring, schema, dedup, or output rule changes. Every M8 decision
+still holds.
+
+---
+
+## D-M9-1 — Ingestion runs on a scheduled runner, not inside the app
+
+**Decision.** The weekly GSC sync and metadata crawl run in a GitHub Actions
+workflow (`.github/workflows/warehouse-sync.yml`) that executes
+`python -m jobs.sync` on a GitHub-hosted runner. The app no longer triggers or
+hosts a scheduled sync.
+
+**Why.** The in-app ingestion path had three structural faults that concurrency
+tuning cannot fix: the Space sleeps after about 48 hours idle, a sync inherited
+the lifetime of whatever request launched it, and it was reachable through an
+unauthenticated secret-in-URL endpoint on a public app. A runner has none of
+these: it wakes on a cron, has its own 6-hour ceiling per job (we cap at 120
+minutes), and takes its secrets from the Actions secret store.
+
+**Feasibility.** The runner can do everything the app can because GSC OAuth
+tokens live in Upstash and BigQuery credentials come from an env var. `jobs/sync`
+imports the same `backend.lib.*` modules the app uses. There are two entrypoints
+into one codebase, not two codebases.
+
+**Do not.** Reintroduce a scheduled trigger that depends on the Space being
+awake, or that runs the full pipeline inside an HTTP request.
+
+---
+
+## D-M9-2 — `AUTO_SYNC_SECRET` and the `/api/admin/auto-sync/{secret}` endpoint are retired [SUPERSEDES the M7 cron endpoint]
+
+**Decision.** The runner is the only scheduled sync trigger. The secret-in-URL
+cron endpoint is no longer the mechanism of record and should be removed from the
+app in the follow-up that deletes it (see "Cutover" in the handoff). Until it is
+deleted, it must not be scheduled against.
+
+**Why.** A secret in a URL path on a public deployment is logged by proxies,
+retained in browser and CDN history, and cannot be rotated without a redeploy.
+The runner authenticates to Upstash and GCP with rotatable, store-held secrets
+that never appear in a URL.
+
+**Do not.** Point any scheduler, uptime monitor, or bot at
+`/api/admin/auto-sync/...`. Do not add a new secret-bearing GET endpoint to
+replace it.
+
+---
+
+## D-M9-3 — The manual admin sync buttons remain, unchanged, as a fallback
+
+**Decision.** `/api/admin/sync-gsc` and `/api/admin/sync-metadata` (the streaming
+admin-card buttons) stay exactly as they are. They are the human-in-the-loop
+fallback for a one-off resync and for watching progress live.
+
+**Why.** They are gated (session cookie required), they stream progress the
+runner log cannot show in real time to a non-engineer, and they are useful when
+someone wants to force a refresh without waiting for Monday. They are not a
+security exposure the way the unauthenticated cron endpoint was.
+
+**Caveat.** These run on the Space and still meet the request-lifetime and sleep
+constraints. For a full 100-plus-domain sync, prefer the runner. The buttons are
+for targeted or observational use.
+
+---
+
+## D-M9-4 — CI runs are strict; a silent warehouse write failure fails the job
+
+**Decision.** The workflow sets `BQ_STRICT_WRITES=true`. On the runner, a
+BigQuery write that reports success while writing nothing raises and turns the
+job red, rather than being logged and swallowed.
+
+**Why.** The entire M8 warehouse-persistence saga was a write that reported
+success and stored nothing. In production the app keeps `BQ_STRICT_WRITES` unset
+so a warehouse hiccup never fails a user's run — that trade-off is correct for a
+user request. It is the wrong trade-off for an unattended sync, where a silent
+failure means a week of stale data with a green checkmark.
+
+**Do not.** Unset `BQ_STRICT_WRITES` in the workflow to make a flaky run pass.
+
+---
+
+## D-M9-5 — Keep-alive is a workflow, and it is a mitigation with an expiry
+
+**Decision.** `.github/workflows/keepalive.yml` pings `/api/gate/status` every 12
+hours to reduce cold starts. It replaces UptimeRobot.
+
+**Why.** One system, versioned and visible, instead of an external account with
+its own credentials and dashboard. But it is a mitigation, not a fix: it reduces
+the frequency of cold starts, it does not remove them.
+
+**Expiry.** When a warm instance lands (Cloud Run `min-instances=1`, deferred on
+budget), delete this workflow. A keep-alive ping against a warm instance is
+pointless.
+
+---
+
+## Deferred to M9.1, with a hard boundary
+
+**Incremental (delta) GSC fetch.** Fetching only the days since the last
+successful sync — roughly 7 days instead of 365 — is the largest remaining speed
+lever and the reason the free proposal quoted a large speedup. It is **not in
+M9** and must not be bolted on.
+
+The blocker is concrete: `_live_gsc_fetch` requests only
+`dimensions: ["query", "page"]` and aggregates the whole window into one row per
+page. `GscRow` carries no per-day date. True daily-incremental facts require
+adding the `date` dimension to the GSC request, extending `GscRow`, and updating
+aggregation, the pipeline, and rank to carry it. That is a schema-contract change
+across several files and it supersedes the weekly-snapshot semantics that
+D-M8-1's load-job partition write and the latest-snapshot read depend on.
+
+M9.1 gets its own spec: append-only daily-partitioned facts, a per-domain
+watermark table, a rolling-window read that replaces the `QUALIFY MAX(date)`
+snapshot read, and the migration path from weekly snapshots to daily facts.
+Until that spec exists, the runner fetches the full 365-day window, exactly as
+the app did. M9 makes that fetch cost nothing extra by moving it off the app and
+onto free infrastructure; it does not make the fetch smaller.
+
+**Cloud Run migration.** Unchanged from M8: spec complete, blocked on budget.
+The `jobs/sync` entrypoint written for the runner is the same entrypoint a Cloud
+Run Job would invoke, so that migration becomes a scheduler swap rather than a
+rewrite.
+
+
+===============================================================================
+=== M9_CHANGES.md ===
+
+# M9_CHANGES.md
+
+## Alpha M9 — ingestion plane moved off the app (free)
+
+The pipeline, scoring, dedup, and locked output schema are unchanged. M9 changes
+only where and how the scheduled sync runs.
+
+---
+
+### A. New standalone entrypoint — `jobs/sync.py`, `jobs/__init__.py`
+
+- Runs the same Phase 1 (live GSC fetch) and Phase 2 (metadata crawl) logic that
+  `routers/admin.py::auto_sync` ran as a fire-and-forget background task, lifted
+  into a script: `python -m jobs.sync`.
+- Reuses `backend.lib.*` verbatim — `fetch_all_domains_live`,
+  `list_gsc_properties`, `fetch_from_bigquery`, `aggregate_to_pages`, the three
+  classify passes, and `crawl_metadata_for_pages`. No logic is reimplemented.
+- Relies on the internal warehouse write inside `_live_gsc_fetch` rather than a
+  second `sync_to_bigquery` call. Under M8's WRITE_TRUNCATE load job the write is
+  idempotent, so there is one write, not two.
+- Loads a local `.env` if `python-dotenv` is present, before importing any
+  backend module, so a developer can run it locally. On a runner the env comes
+  from Actions secrets and the `.env` load is a silent no-op.
+- `--phase all|gsc|metadata` selects a phase; default is both.
+- Exits non-zero on any failure so a CI runner marks the job red. `SystemExit`
+  codes: 2 = BigQuery not configured, 3 = fetch returned no rows, 1 = unhandled.
+
+### B. Two workflows — `.github/workflows/`
+
+- `warehouse-sync.yml` — Mondays 04:00 UTC, plus manual `workflow_dispatch` with
+  a phase picker. Sets `BQ_STRICT_WRITES=true`. A `concurrency` group serializes
+  runs so a manual trigger during a scheduled run waits instead of doubling GSC
+  quota — the workflow-level analog of M8's single-flight guard.
+- `keepalive.yml` — every 12 hours, pings `/api/gate/status` to reduce Space
+  cold starts. Replaces UptimeRobot. Tolerates non-2xx: the goal is to wake the
+  Space, not to assert health.
+
+### C. What is retired
+
+- `AUTO_SYNC_SECRET` and `/api/admin/auto-sync/{secret}` as the scheduled
+  trigger. Nothing should be pointed at that endpoint anymore. Deleting the
+  endpoint and the env var from the app is a follow-up (see handoff, Cutover).
+- UptimeRobot, replaced by `keepalive.yml`.
+
+### D. Explicitly unchanged (binding)
+
+- Output schema: Page URL | Page Category | Topical Relevance Score | SEO Score.
+- Weights 70/30; composite before dedup (D2); no TF-IDF fallback (D1).
+- The weekly-snapshot write model and the M8 load-job partition write (D-M8-1).
+- The manual admin sync buttons (`/api/admin/sync-gsc`, `/api/admin/sync-metadata`),
+  kept as a gated fallback (D-M9-3).
+- The full 365-day fetch window. M9 does not make the fetch smaller; it makes it
+  free by relocating it. Incremental delta fetch is M9.1 (D-M9-5, deferred).
+
+### E. Not included, deliberately
+
+- **Incremental delta fetch** (7 days instead of 365). This is the real speed
+  lever, and it is a schema-contract change: the GSC request would gain a `date`
+  dimension, `GscRow` would carry a date, and aggregation, pipeline, and rank
+  would change to match. It supersedes the weekly-snapshot semantics D-M8-1
+  depends on and needs its own spec. See D-M9-5.
+- **Watermark table.** It is a prerequisite for incremental fetch, so it lands
+  with M9.1, not before.
+
+
+===============================================================================
+=== M9_HANDOFF.md ===
+
+# Nexus Placement Intelligence — M9 Handoff and Setup Guide
+
+**Milestone:** Alpha M9 (ingestion plane moved off the app, free)
+**Starts from:** M8 (FastAPI + Next.js, Docker on Hugging Face Spaces)
+**Status:** built and validated locally; not yet run on a real runner
+**Read alongside:** `M9_DECISIONS.md`, `M9_CHANGES.md`, `M8_DECISIONS.md`
+
+---
+
+## 1. What M9 does in one paragraph
+
+The scheduled warehouse sync no longer runs inside the app. It runs in a GitHub
+Actions runner that executes `python -m jobs.sync`, using the same code the app
+uses and the same secrets. This removes the three structural faults of the
+in-app sync at once: the Space sleeping mid-sync, the sync inheriting a request
+lifetime, and an unauthenticated secret-in-URL cron endpoint on a public app.
+Cost is zero: the repo is public, so Actions minutes are unlimited, and the sync
+already writes to BigQuery via free load jobs. What M9 does not do is make the
+GSC fetch smaller — that is M9.1, and it needs its own schema spec.
+
+---
+
+## 2. Files in this drop
+
+```
+jobs/
+  __init__.py
+  sync.py                       standalone entrypoint: python -m jobs.sync
+.github/workflows/
+  warehouse-sync.yml            weekly sync + manual dispatch
+  keepalive.yml                 12-hourly ping, replaces UptimeRobot
+M9_DECISIONS.md
+M9_CHANGES.md
+M9_HANDOFF.md                   this file
+```
+
+Nothing under `backend/` or `frontend/` changes in M9. The entrypoint imports
+existing modules; it does not modify them.
+
+---
+
+## 3. Setup guide (about 15 minutes)
+
+### Step 1 — Add the files to the repo
+
+Copy `jobs/` and `.github/workflows/` into the repo root and commit to `main`.
+Because `.github/workflows/` is owned by the repo and is not part of the app
+image, this does not affect the Space build.
+
+### Step 2 — Add the Actions secrets
+
+In the repo: **Settings, then Secrets and variables, then Actions, then New
+repository secret**. Add each of these with the same values the Space uses
+(Space: **Settings, then Variables and secrets**):
+
+| Secret | What it is |
+|---|---|
+| `GOOGLE_CLIENT_ID` | OAuth web client ID |
+| `GOOGLE_CLIENT_SECRET` | OAuth web client secret |
+| `APP_BASE_URL` | The production Space URL, e.g. `https://your-space.hf.space` |
+| `UPSTASH_REDIS_REST_URL` | Upstash REST URL (holds the GSC tokens) |
+| `UPSTASH_REDIS_REST_TOKEN` | Upstash REST token |
+| `BQ_PROJECT_ID` | BigQuery project |
+| `BQ_DATASET_ID` | BigQuery dataset |
+| `GCP_SERVICE_ACCOUNT_JSON` | The service account JSON, pasted whole |
+| `HF_API_TOKEN` | HF Inference token |
+
+Optional tuning as a **variable** (not a secret): `GSC_MAX_WORKERS` (default 16).
+
+Confirm the service account has **BigQuery Data Editor** and **BigQuery Job
+User** on the project, and that both Google accounts are already connected at
+`/setup` (the runner reads their tokens from Upstash; it cannot connect them).
+
+### Step 3 — Do a dry run by hand before trusting the schedule
+
+Actions tab, pick **warehouse-sync**, **Run workflow**, choose phase **gsc**.
+Watch the log. You want to see a non-zero row count on the line
+`GSC sync complete: N rows fetched and persisted.` If it fails:
+
+- `BigQuery not configured` (exit 2): a `BQ_*` or `GCP_SERVICE_ACCOUNT_JSON`
+  secret is missing.
+- `No GSC data returned` (exit 3): the accounts are not connected at `/setup`, or
+  the service account lacks Data Editor.
+- A parse error on `GCP_SERVICE_ACCOUNT_JSON`: the JSON was pasted with extra
+  quotes or truncated.
+
+Then run it again with phase **metadata**, then once with phase **all**.
+
+### Step 4 — Prove idempotency (the M8 check, now on the runner)
+
+Run **warehouse-sync** (phase gsc) twice in the same week. Open the admin card
+or `/api/admin/status`. The row count and click totals must stay flat, not
+double. If they grow, stop and check that `sync_to_bigquery` is still doing a
+WRITE_TRUNCATE load into the partition decorator (M8 D-M8-1). Do not leave the
+schedule enabled if numbers grow.
+
+### Step 5 — Let the schedule run
+
+Once Steps 3 and 4 pass, the schedules are already live (they are defined in the
+workflow files). The next Monday 04:00 UTC sync runs on its own, and the
+keep-alive pings every 12 hours starting immediately.
+
+### Step 6 — Cutover: retire the old cron
+
+Once a scheduled run has succeeded on its own:
+
+- Turn off UptimeRobot (or whatever was pinging the Space).
+- Remove any external scheduler that hits `/api/admin/auto-sync/...`.
+- Plan the follow-up commit that deletes the `auto-sync` endpoint and the
+  `AUTO_SYNC_SECRET` env var from the app (D-M9-2). Not required for M9 to work,
+  but the endpoint is a standing exposure until it is gone.
+
+---
+
+## 4. Running it locally (optional)
+
+```
+pip install -r backend/requirements.txt
+# put the same secrets in a local .env (python-dotenv picks it up)
+python -m jobs.sync --phase gsc
+```
+
+The `.env` is only for local runs. It must never be committed — the repo is
+public and `.gitignore` already excludes it.
+
+---
+
+## 5. Verification checklist
+
+- [ ] `warehouse-sync` phase gsc logs a non-zero persisted row count.
+- [ ] `warehouse-sync` phase metadata completes without error.
+- [ ] Two gsc runs in one week leave row and click totals flat, not doubled.
+- [ ] The admin card / `/api/admin/status` shows a recent GSC sync date.
+- [ ] A user run reads from the warehouse (logs it is fresh) rather than fetching
+      live.
+- [ ] `keepalive` runs green and the Space answers `/api/gate/status`.
+- [ ] UptimeRobot and the `auto-sync` cron are retired (Step 6).
+
+---
+
+## 6. Known limits and what comes next
+
+- **Cron drift.** Scheduled workflows can start several minutes late under load.
+  Irrelevant for a weekly batch.
+- **Cold start still exists.** Keep-alive reduces it; only a warm instance
+  removes it. Deferred on budget (Cloud Run `min-instances=1`).
+- **The fetch is still 365 days.** M9 relocated it; it did not shrink it.
+  Incremental delta fetch is M9.1 and is the next real speed work. It needs the
+  schema spec described in D-M9-5 before any code: append-only daily facts, a
+  per-domain watermark table, and a rolling-window read to replace the
+  latest-snapshot read.
+- **Migration path stays clean.** `jobs/sync` is the same entrypoint a Cloud Run
+  Job would invoke, so the eventual paid migration is a scheduler swap, not a
+  rewrite.
+
+---
+
+## 7. Working conventions (unchanged)
+
+- Planning before implementation; explicit approval first.
+- Whole-file replacements, not diffs.
+- `flat.txt` is the canonical per-milestone source artifact, milestone-prefixed.
+- Documentation set per milestone: handoff, decisions, changes, flat, ZIP.
+- US standard English spelling.
+

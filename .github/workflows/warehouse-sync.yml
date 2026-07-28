@@ -1,0 +1,84 @@
+# Alpha M9 — warehouse sync on a schedule, off the app.
+#
+# This replaces the /api/admin/auto-sync/{secret} cron endpoint. Ingestion now
+# runs in a GitHub-hosted runner: no Space wake, no request timeout, no secret
+# in a URL. The runner has the same secrets the app has, and tokens live in
+# Upstash, so it can do the full sync on its own.
+#
+# Schedule: Mondays 04:00 UTC. Cron on GitHub Actions can start a few minutes
+# late under load, which is irrelevant for a weekly batch.
+#
+# You can also run it by hand from the Actions tab (workflow_dispatch), choosing
+# a phase. This is the manual "Sync GSC data" / "Sync page metadata" button from
+# the admin card, moved to a place that has no timeout ceiling.
+
+name: warehouse-sync
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Which phase to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - gsc
+          - metadata
+
+# One sync at a time. A manual run started during a scheduled run waits rather
+# than doubling GSC quota burn — the workflow-level equivalent of M8's
+# single-flight guard.
+concurrency:
+  group: warehouse-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Run warehouse sync
+        env:
+          # Fail the job on a silent warehouse write failure.
+          BQ_STRICT_WRITES: "true"
+
+          # Google OAuth app (same client the Space uses).
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          # APP_BASE_URL is only used to construct the OAuth redirect URI, which
+          # the sync path never calls. It must be set to satisfy _require_env;
+          # point it at the production Space URL.
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+
+          # Upstash Redis REST — where the GSC OAuth tokens are stored.
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+
+          # BigQuery warehouse.
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+
+          # HF Inference token — used by the embedding path in scoring. Not
+          # strictly needed for a fetch+crawl sync, but harmless to provide.
+          HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
+
+          # Optional concurrency override. Leave unset to use the default of 16.
+          GSC_MAX_WORKERS: ${{ vars.GSC_MAX_WORKERS }}
+        run: |
+          python -m jobs.sync --phase "${{ github.event.inputs.phase || 'all' }}"

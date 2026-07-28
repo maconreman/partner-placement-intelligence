@@ -1,0 +1,31 @@
+# Alpha M9 — keep the Space awake, off third-party uptime monitors.
+#
+# The HF Space sleeps after ~48h idle. A cold wake is a slow first request but
+# not a failure. This pings a lightweight endpoint every 12h so the partnerships
+# team rarely meets a cold start. It replaces the UptimeRobot hack with a job
+# that is versioned, visible, and in the same place as everything else.
+#
+# This is a mitigation, not a fix. The permanent fix is a warm instance
+# (Cloud Run min-instances=1), which is deferred on budget. When that lands,
+# delete this workflow.
+
+name: keepalive
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the gate status endpoint
+        env:
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          # /api/gate/status is open (no session cookie) and cheap. A non-2xx is
+          # tolerated: the point is to wake the Space, not to assert health.
+          curl --silent --show-error --max-time 60 \
+            "${APP_BASE_URL%/}/api/gate/status" || true
