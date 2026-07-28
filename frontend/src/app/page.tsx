@@ -29,7 +29,9 @@ const STAGES: { id: StageId; label: string }[] = [
 
 const WIZARD_STEPS = ["Domains", "Topic & dates", "Results"];
 const GSC_LAG_DAYS = 3;
-const PREVIEW_COLLAPSED = 5;
+// M9.2: the Top 10 is always shown in full. The backend only ever sends 10
+// preview rows (pipeline.py results[:10]); the fuller set lives in the export.
+const PREVIEW_TOP_N = 10;
 
 // Vertical display order for the Step 1 filter chip row.
 // FFG is always first; client verticals follow alphabetically.
@@ -331,9 +333,14 @@ export default function Wizard() {
   const [runError, setRunError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const consoleRef = useRef<HTMLDivElement>(null);
+  const runStartRef = useRef<number | null>(null);  // M9.2: wall-clock run start
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
-  const [showAll, setShowAll] = useState(false);
+  // M9.2: frozen run metadata, captured when a run finishes, shown in Results.
+  const [completedAt, setCompletedAt] = useState<Date | null>(null);
+  const [runDurationSec, setRunDurationSec] = useState<number | null>(null);
+  // M9.2: the Step 1 vertical filter chips are collapsed by default.
+  const [chipsOpen, setChipsOpen] = useState(false);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [exporting, setExporting] = useState(false);
   const [exportUrl, setExportUrl] = useState("");
@@ -417,7 +424,9 @@ export default function Wizard() {
   const goRun = async () => {
     if (!topic.trim()) return setFormErr("Enter a topic before running");
     setFormErr(""); setStep(3); setRunError(null); setExportUrl(""); setPreview([]); setExportRows([]);
-    setFunnel(null); setLogLines([]); setShowAll(false); setExpanded(new Set());
+    setFunnel(null); setLogLines([]); setExpanded(new Set());
+    setCompletedAt(null); setRunDurationSec(null);
+    runStartRef.current = Date.now();
     setStages({ fetch: "idle", pages: "idle", seo: "idle", metadata: "idle", match: "idle", refine: "idle", rank: "idle" });
     setElapsedSec(0);
     setRunning(true);
@@ -443,7 +452,16 @@ export default function Wizard() {
     else if (e.type === "log") setLogLines((prev) => [...prev, e.message]);
     else if (e.type === "funnel") setFunnel(e);
     else if (e.type === "error") setRunError(e.message);
-    else if (e.type === "result") { setExportRows(e.rows); setPreview(e.preview); }
+    else if (e.type === "result") {
+      setExportRows(e.rows); setPreview(e.preview);
+      // M9.2: freeze the completion timestamp and total run time for the
+      // Results header. Duration is wall-clock (now minus run start), which is
+      // accurate regardless of this handler's captured render state.
+      setCompletedAt(new Date());
+      if (runStartRef.current != null) {
+        setRunDurationSec(Math.max(0, Math.round((Date.now() - runStartRef.current) / 1000)));
+      }
+    }
   }
 
   const doExport = async () => {
@@ -480,7 +498,18 @@ export default function Wizard() {
     );
   }
 
-  const visible = showAll ? preview : preview.slice(0, PREVIEW_COLLAPSED);
+  // M9.2: always the Top 10, no expand/collapse toggle.
+  const visible = preview.slice(0, PREVIEW_TOP_N);
+  const runCompletedLabel =
+    completedAt
+      ? `${completedAt.toLocaleString()} · ran in ${
+          runDurationSec != null
+            ? runDurationSec >= 60
+              ? `${Math.floor(runDurationSec / 60)}m ${runDurationSec % 60}s`
+              : `${runDurationSec}s`
+            : "n/a"
+        }`
+      : "";
   const activeStage = STAGES.find((s) => stages[s.id] === "active");
   const doneCount = STAGES.filter((s) => stages[s.id] === "done").length;
 
@@ -511,7 +540,19 @@ export default function Wizard() {
             </div>
             {domains.length > 0
               ? <>
-                  <VerticalChipGrid domains={domains} selected={selected} onSelectMany={selectMany} />
+                  {/* M9.2: vertical filter chips collapsed by default. The
+                      domain grid below always stays visible (D-M8-6); only the
+                      bulk-select chip row collapses. */}
+                  <details
+                    className="chip-disclosure"
+                    open={chipsOpen}
+                    onToggle={(e) => setChipsOpen((e.currentTarget as HTMLDetailsElement).open)}
+                  >
+                    <summary className="chip-disclosure-summary">Filter by vertical</summary>
+                    <div className="chip-disclosure-body">
+                      <VerticalChipGrid domains={domains} selected={selected} onSelectMany={selectMany} />
+                    </div>
+                  </details>
                   <div className="domain-grid">
                     {domains.map((d) => (
                       <label key={d.siteUrl} className={`domain ${selected.has(d.siteUrl) ? "sel" : ""}`}>
@@ -576,7 +617,10 @@ export default function Wizard() {
               </div>
             )}
             {!running && !runError && preview.length > 0 && (
-              <div className="run-status">Complete, {preview.length} pages scored</div>
+              <div className="run-status">
+                Complete, {preview.length} pages scored
+                {runCompletedLabel && <span className="run-completed">{runCompletedLabel}</span>}
+              </div>
             )}
             <div className="tracker">
               {STAGES.map((s) => (
@@ -614,12 +658,10 @@ export default function Wizard() {
 
                 <div className="results-meta">
                   <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
-                    Showing {visible.length} of {preview.length}
+                    Top {visible.length} results
                   </span>
-                  {preview.length > PREVIEW_COLLAPSED && (
-                    <button className="ghost tiny" onClick={() => setShowAll(!showAll)}>
-                      {showAll ? "Show fewer" : `Show all ${preview.length}`}
-                    </button>
+                  {runCompletedLabel && (
+                    <span className="results-timestamp">{runCompletedLabel}</span>
                   )}
                 </div>
 
