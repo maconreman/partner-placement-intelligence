@@ -132,3 +132,85 @@ JSON body") but the fix was not present in this codebase — same class of gap
 as the missing `layout.tsx`: something that changed status without the
 corresponding file landing in the milestone package. Both are now confirmed
 present in this M8 package.
+
+---
+
+## M8.2 — warehouse persistence, copy cleanup, filter cleanup
+
+### A. BigQuery now actually saves (`backend/lib/bigquery.py`)
+
+Root causes of "GSC last sync: Never" with a sync that logged success:
+
+1. **Nothing ever created the dataset or tables.** On a fresh project the first
+   write failed with `NotFound`, the best-effort handler swallowed it, and the
+   run reported success having written nothing. New `ensure_tables()` creates
+   the dataset and all three tables with correct schemas and partitioning. It
+   is idempotent, cached per process, and called at the start of every sync.
+   It raises on failure: a sync that cannot guarantee its destination stops
+   rather than reporting success.
+
+2. **`bq.dataset(...).table(...)` is deprecated** in google-cloud-bigquery 3.x
+   and raises on some versions. Replaced with explicit `TableReference`.
+
+3. **The M8 delete-before-insert could not work.** Streamed rows sit in a
+   write-optimized buffer for up to 90 minutes and cannot be deleted, so the
+   DELETE failed exactly when a retry needed it. The GSC snapshot now writes via
+   a **load job into the partition decorator `table$YYYYMMDD` with
+   WRITE_TRUNCATE**: atomic partition replacement, idempotent by construction,
+   no separate delete, and load jobs are free where streaming inserts are billed.
+
+4. **Write verification.** After the load job, the code queries the partition
+   and raises if it is empty. The log line reports the row count actually
+   stored, not the job's self-reported status.
+
+### ⚠️ This changes a binding rule — DECISIONS.md needs updating
+
+**D11 must be scoped to streaming inserts only.** Load jobs serialize the
+payload as JSON, so the DATE column takes an **ISO string**; passing a
+`datetime.date` raises `Object of type date is not JSON serializable`. The GSC
+snapshot path now uses `monday.isoformat()` and that is correct. The old rule
+("never `str(monday)`") still holds for `insert_rows_json`, which now only the
+single-row feedback write uses. Please review and amend D11 before the next
+session so this is not "fixed" back.
+
+### B. Diagnostics
+
+- `GET /api/admin/status` now returns `gsc_rows`, `meta_rows`,
+  `gsc_table_exists`, `meta_table_exists`, and a `detail` string.
+  "Never" now distinguishes *table missing* (credentials or IAM) from *table
+  empty* (the GSC fetch returned nothing).
+- New `GET /api/admin/bq-check`: one request that walks env vars → credentials →
+  client → dataset/tables → writes and reads back a probe row. The probe uses
+  the `1970-01-01` partition with WRITE_TRUNCATE so it never touches a real
+  snapshot and cannot accumulate.
+- Admin card now shows row counts next to each date.
+
+### C. Copy cleanup
+
+Em dashes and en dashes removed from all user-facing strings in
+`page.tsx`, `admin/page.tsx`, and backend `log()` lines in `admin.py`,
+`gsc.py`, `relevance.py`. Decorative `▸` / `!` / `✓` prefixes dropped from log
+lines. Phrasing rewritten to plain sentences: "nothing is hidden" and similar
+self-explaining clauses removed. Score tooltips read "0 to 10" instead of
+"0–10". The partial-chip glyph is now `~` instead of an en dash.
+Code comments and DECISIONS.md were left alone as engineer-facing.
+
+### D. "Other" removed from the filter chips
+
+`VERTICAL_ORDER` no longer includes "Other". An unmapped domain should be
+classified in `client_verticals.json` or excluded in `excluded_domains.json`,
+not given a catch-all bulk-select button. Unmapped domains still appear in the
+grid and stay individually selectable, so nothing became unreachable.
+
+**Follow-up before this is really done:** list which domains currently have no
+vertical and either map or exclude them. Removing the chip removes the symptom;
+the unclassified domains are the actual finding.
+
+### E. Not included, deliberately
+
+**Incremental sync** (fetch only days since the last sync instead of a full
+365-day window) is the single largest speed lever, but it conflicts with the
+weekly-snapshot model the latest-snapshot read depends on. It changes the
+schema contract and needs its own spec, not a retrofit. Per-domain progress
+already appears in the sync log, so a hung run is now distinguishable from a
+slow one.

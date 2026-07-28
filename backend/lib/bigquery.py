@@ -3,11 +3,38 @@ bigquery.py — BigQuery warehouse read/write.
 Port of bigquery.ts. Preserves D11 (bq DATE wrapper), D12 (freshness gate),
 D13 (no Sheets fallback).
 
-M7 fix: _client() now strips GCP_SERVICE_ACCOUNT_JSON before the truthiness
-check and wraps json.loads in a specific JSONDecodeError handler. The old code
-let json.loads("") or json.loads("\n") raise a generic JSONDecodeError which
-bubbled up as "BigQuery unavailable (Expecting value: line 1 column 1 (char 0))",
-making a misconfigured secret indistinguishable from BigQuery being unreachable.
+M7 fix: _client() strips GCP_SERVICE_ACCOUNT_JSON before the truthiness check
+and wraps json.loads in a specific JSONDecodeError handler, so a misconfigured
+secret is distinguishable from BigQuery being unreachable.
+
+M8.2 fixes, addressing "GSC last sync: Never" with an apparently successful sync:
+
+1. ensure_tables() creates the dataset and all three tables when missing.
+   Previously nothing created them. On a fresh project the first insert failed
+   with NotFound, the exception was swallowed by the best-effort handler, and
+   the run reported success while writing nothing.
+
+2. The GSC snapshot is written with a load job into a partition decorator
+   (table$YYYYMMDD) using WRITE_TRUNCATE, replacing the previous streaming
+   insert plus DELETE. Three reasons:
+     a. Streamed rows sit in a write-optimized buffer for up to 90 minutes and
+        cannot be deleted, so the M8 delete-before-insert failed on any re-run
+        inside that window, which is exactly when a retry happens.
+     b. WRITE_TRUNCATE on one partition is atomic, so idempotency no longer
+        depends on a separate delete succeeding first.
+     c. Load jobs are free. Streaming inserts are billed per byte.
+
+3. IMPORTANT, and it reverses a previous rule: load jobs take DATE values as
+   ISO strings in the JSON payload, not as datetime.date objects. D11 (native
+   date object required) applies to the streaming-insert path, which the GSC
+   snapshot no longer uses. Passing a date object to a load job raises
+   "Object of type date is not JSON serializable". Do not "restore" D11 here.
+   DECISIONS.md needs updating to scope D11 to streaming inserts only.
+
+4. bq.dataset(...).table(...) replaced with explicit TableReference. The old
+   form is deprecated in google-cloud-bigquery 3.x and raises on some versions.
+
+5. get_last_sync() backs the /admin status card, which is what renders "Never".
 """
 from __future__ import annotations
 import os
@@ -22,7 +49,8 @@ from .util import GscRow, MetaRow, FeedbackRow, LogFn
 
 _bq_client: Optional[bigquery.Client] = None
 
-BQ_CHUNK_SIZE = 500  # streaming insert chunk limit
+# Only the single-row feedback write still uses a streaming insert.
+BQ_CHUNK_SIZE = 500
 
 # M7: When BQ_STRICT_WRITES is truthy, any streaming-insert error is raised
 # instead of swallowed. This surfaces silent row drops during testing — the
@@ -58,6 +86,141 @@ def _client() -> bigquery.Client:
     else:
         _bq_client = bigquery.Client(project=BQ_PROJECT_ID)
     return _bq_client
+
+
+# ── Table schemas ─────────────────────────────────────────────────────────────
+# Declared here so ensure_tables() can create anything missing. The GSC table is
+# partitioned on `date`, which is what makes the partition-decorator overwrite
+# in sync_to_bigquery() possible.
+_GSC_SCHEMA = [
+    bigquery.SchemaField("account", "STRING"),
+    bigquery.SchemaField("domain", "STRING"),
+    bigquery.SchemaField("query", "STRING"),
+    bigquery.SchemaField("page", "STRING"),
+    bigquery.SchemaField("clicks", "INTEGER"),
+    bigquery.SchemaField("impressions", "INTEGER"),
+    bigquery.SchemaField("position", "FLOAT"),
+    bigquery.SchemaField("date", "DATE"),
+]
+
+_META_SCHEMA = [
+    bigquery.SchemaField("snapshot_date", "DATE"),
+    bigquery.SchemaField("page", "STRING"),
+    bigquery.SchemaField("meta_title", "STRING"),
+    bigquery.SchemaField("meta_description", "STRING"),
+    bigquery.SchemaField("h1", "STRING"),
+    bigquery.SchemaField("h2", "STRING"),
+]
+
+_FEEDBACK_SCHEMA = [
+    bigquery.SchemaField("submitted_at", "DATE"),
+    bigquery.SchemaField("query", "STRING"),
+    bigquery.SchemaField("vertical", "STRING"),
+    bigquery.SchemaField("category", "STRING"),
+    bigquery.SchemaField("topic", "STRING"),
+    bigquery.SchemaField("domains", "STRING"),
+]
+
+_ensured = False
+
+
+def _tref(table_id: str) -> bigquery.TableReference:
+    """Explicit TableReference. Replaces the deprecated bq.dataset().table()."""
+    return bigquery.TableReference(
+        bigquery.DatasetReference(BQ_PROJECT_ID, BQ_DATASET_ID), table_id
+    )
+
+
+def ensure_tables(log: LogFn = print) -> None:
+    """
+    Create the dataset and any missing tables. Idempotent and cached per process.
+
+    Called at the start of every admin and cron sync. Without this, a fresh GCP
+    project fails its first insert with NotFound, the best-effort handler
+    swallows it, and the admin card keeps reading "Never" while the sync log
+    claims success.
+
+    Raises on failure. A sync that cannot guarantee its destination should stop
+    rather than continue and report success.
+    """
+    global _ensured
+    if _ensured:
+        return
+    if not BQ_PROJECT_ID or not BQ_DATASET_ID:
+        raise RuntimeError(
+            "BQ_PROJECT_ID and BQ_DATASET_ID must be set. On Hugging Face these "
+            "live in the Space's Settings > Variables and secrets, not in .env."
+        )
+    bq = _client()
+
+    ds_ref = bigquery.DatasetReference(BQ_PROJECT_ID, BQ_DATASET_ID)
+    try:
+        bq.get_dataset(ds_ref)
+    except Exception:
+        ds = bigquery.Dataset(ds_ref)
+        ds.location = os.environ.get("BQ_LOCATION", "US")
+        bq.create_dataset(ds, exists_ok=True)
+        log(f"Created dataset {BQ_PROJECT_ID}.{BQ_DATASET_ID}.")
+
+    plan = [
+        (BQ_TABLE_ID, _GSC_SCHEMA, "date"),
+        (BQ_META_TABLE_ID, _META_SCHEMA, "snapshot_date"),
+        (BQ_FEEDBACK_TABLE_ID, _FEEDBACK_SCHEMA, None),
+    ]
+    for table_id, schema, partition_field in plan:
+        if not table_id:
+            continue
+        ref = _tref(table_id)
+        try:
+            bq.get_table(ref)
+            continue
+        except Exception:
+            pass
+        table = bigquery.Table(ref, schema=schema)
+        if partition_field:
+            table.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY, field=partition_field
+            )
+        bq.create_table(table, exists_ok=True)
+        log(f"Created table {BQ_DATASET_ID}.{table_id}.")
+
+    _ensured = True
+
+
+def get_last_sync() -> dict:
+    """
+    Newest snapshot date in the GSC and metadata tables, plus row counts.
+
+    Backs the /admin status card. Returns None dates when a table is absent or
+    empty, which is what the card renders as "Never". Distinguishing absent from
+    empty matters: absent means ensure_tables() never ran, empty means the sync
+    ran and wrote nothing.
+    """
+    bq = _client()
+    out: dict = {
+        "gsc_last_sync": None, "gsc_rows": 0, "gsc_table_exists": False,
+        "meta_last_sync": None, "meta_rows": 0, "meta_table_exists": False,
+    }
+    for key, table_id, date_col in (
+        ("gsc", BQ_TABLE_ID, "date"),
+        ("meta", BQ_META_TABLE_ID, "snapshot_date"),
+    ):
+        if not table_id:
+            continue
+        try:
+            bq.get_table(_tref(table_id))
+        except Exception:
+            continue
+        out[f"{key}_table_exists"] = True
+        sql = (
+            f"SELECT MAX({date_col}) AS max_date, COUNT(*) AS n "
+            f"FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_id}`"
+        )
+        row = next(iter(bq.query(sql).result()), None)
+        if row and row.max_date:
+            out[f"{key}_last_sync"] = str(row.max_date)
+        out[f"{key}_rows"] = int(row.n) if row and row.n else 0
+    return out
 
 
 def _week_monday() -> str:
@@ -148,60 +311,76 @@ async def fetch_from_bigquery(
 
 
 async def sync_to_bigquery(rows: list[GscRow], log: LogFn = print) -> None:
-    """Best-effort write of freshly fetched GSC rows to warehouse. Never throws."""
+    """
+    Write the weekly GSC snapshot, replacing this week's partition atomically.
+
+    Uses a load job into the partition decorator table$YYYYMMDD with
+    WRITE_TRUNCATE. Re-running in the same week replaces the snapshot rather
+    than appending, so manual re-syncs, Cloud Scheduler retries and accidental
+    double triggers are all idempotent by construction.
+
+    This replaces the earlier streaming insert plus DELETE. Streamed rows are
+    undeletable for up to 90 minutes, so the delete failed precisely when a
+    retry needed it. Load jobs are also free, where streaming inserts are billed.
+
+    Note on date typing, which reverses the older streaming rule: load jobs
+    serialize the payload as JSON, so the DATE column takes an ISO string.
+    Passing a datetime.date object here raises "Object of type date is not JSON
+    serializable". D11's native-date requirement applies to insert_rows_json,
+    not to this path.
+
+    Best-effort unless BQ_STRICT_WRITES is set, in which case failures raise so
+    they surface during testing instead of being swallowed.
+    """
     if not rows:
+        log("No rows to write, skipping warehouse write.")
         return
     try:
+        ensure_tables(log)
         bq = _client()
-        # D11: DATE partition column requires a native datetime.date object.
-        # A plain ISO string is silently rejected on streaming inserts when the
-        # column is a partition key, making the insert appear to succeed while
-        # writing nothing. fromisoformat() produces the required typed value.
         monday = date.fromisoformat(_week_monday())
-
-        # M8 fix: delete this Monday's snapshot before inserting, so re-runs
-        # within the same week (manual re-sync, Cloud Scheduler retry, or an
-        # accidental double trigger) replace the snapshot instead of appending
-        # duplicate rows. CAST(@snapshotDate AS DATE) keeps the parameter a
-        # typed DATE at the SQL boundary (same discipline as D11).
-        # Best-effort: a delete failure is logged and the insert proceeds —
-        # the latest-snapshot read (fetch_from_bigquery) tolerates duplicate
-        # rows within one snapshot via MAX().
-        try:
-            del_sql = f"DELETE FROM {_table_ref()} WHERE date = @snapshotDate"
-            del_cfg = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("snapshotDate", "DATE", monday),
-                ]
-            )
-            bq.query(del_sql, job_config=del_cfg).result()
-        except Exception as del_exc:
-            log(f"! Could not clear existing snapshot for {monday} ({del_exc}) — appending instead.")
         payload = [
             {
                 "account": r.account, "domain": r.domain, "query": r.query,
                 "page": r.page, "clicks": r.clicks, "impressions": r.impressions,
-                "position": r.position, "date": monday,
+                "position": r.position, "date": monday.isoformat(),
             }
             for r in rows
         ]
-        table = bq.dataset(BQ_DATASET_ID).table(BQ_TABLE_ID)
-        total_errors = 0
-        for i in range(0, len(payload), BQ_CHUNK_SIZE):
-            errors = bq.insert_rows_json(table, payload[i:i + BQ_CHUNK_SIZE])
-            if errors:
-                total_errors += len(errors)
-                log(f"! Warehouse write errors (chunk {i}): {errors[:2]}")
-                if BQ_STRICT_WRITES:
-                    raise RuntimeError(f"BigQuery rejected {len(errors)} rows at chunk {i}: {errors[:2]}")
-        if total_errors:
-            log(f"! Warehouse warm-up wrote {len(rows) - total_errors:,} of {len(rows):,} rows ({total_errors} rejected).")
-        else:
-            log(f"✓ Warmed warehouse with {len(rows):,} rows.")
+        target = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}${monday.strftime('%Y%m%d')}"
+        job_config = bigquery.LoadJobConfig(
+            schema=_GSC_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        job = bq.load_table_from_json(payload, target, job_config=job_config)
+        job.result()
+        if job.errors:
+            raise RuntimeError(f"Load job reported errors: {job.errors[:2]}")
+
+        # Confirm from the table itself rather than trusting the job status.
+        # A silently empty warehouse is the failure this path exists to prevent,
+        # so the log line reflects what is actually stored.
+        verify_sql = (
+            f"SELECT COUNT(*) AS n FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}` "
+            "WHERE date = @snapshotDate"
+        )
+        verify_cfg = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("snapshotDate", "DATE", monday)]
+        )
+        stored = next(iter(bq.query(verify_sql, job_config=verify_cfg).result()), None)
+        n = int(stored.n) if stored and stored.n else 0
+        if n == 0:
+            raise RuntimeError(
+                f"Load job completed but the {monday} partition is empty. Check "
+                "that the service account has BigQuery Data Editor on "
+                f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}."
+            )
+        log(f"Warmed warehouse with {n:,} rows for snapshot {monday}.")
     except Exception as e:
         if BQ_STRICT_WRITES:
             raise
-        log(f"! Warehouse warm-up skipped: {e}")
+        log(f"Warehouse write failed: {e}")
 
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
@@ -233,37 +412,46 @@ async def read_meta_from_bigquery(pages: list[str]) -> list[MetaRow]:
 
 
 async def sync_meta_to_bigquery(rows: list[MetaRow], log: LogFn = print) -> None:
+    """
+    Append today's page metadata snapshot.
+
+    Appends rather than overwrites because read_meta_from_bigquery() takes the
+    newest row per page, so older snapshots are harmless history. Uses a load
+    job for the same reasons as the GSC write: free, and no streaming buffer.
+    """
     if not rows:
         return
     try:
+        ensure_tables(log)
         bq = _client()
-        snapshot_date = date.today().isoformat()
+        today = date.today().isoformat()
         payload = [
             {
-                "snapshot_date": snapshot_date,
+                "snapshot_date": today,
                 "page": r.page, "meta_title": r.meta_title,
                 "meta_description": r.meta_description,
                 "h1": r.h1, "h2": r.h2,
             }
             for r in rows
         ]
-        table = bq.dataset(BQ_DATASET_ID).table(BQ_META_TABLE_ID)
-        total_errors = 0
-        for i in range(0, len(payload), BQ_CHUNK_SIZE):
-            errors = bq.insert_rows_json(table, payload[i:i + BQ_CHUNK_SIZE])
-            if errors:
-                total_errors += len(errors)
-                log(f"! Metadata write errors (chunk {i}): {errors[:2]}")
-                if BQ_STRICT_WRITES:
-                    raise RuntimeError(f"BigQuery rejected {len(errors)} metadata rows at chunk {i}: {errors[:2]}")
-        if total_errors:
-            log(f"! Metadata warehouse wrote {len(rows) - total_errors:,} of {len(rows):,} pages ({total_errors} rejected).")
-        else:
-            log(f"✓ Saved {len(rows):,} pages to the metadata warehouse.")
+        job_config = bigquery.LoadJobConfig(
+            schema=_META_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        job = bq.load_table_from_json(
+            payload,
+            f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_META_TABLE_ID}",
+            job_config=job_config,
+        )
+        job.result()
+        if job.errors:
+            raise RuntimeError(f"Metadata load job reported errors: {job.errors[:2]}")
+        log(f"Saved {len(rows):,} pages to the metadata warehouse.")
     except Exception as e:
         if BQ_STRICT_WRITES:
             raise
-        log(f"! Metadata warehouse write skipped: {e}")
+        log(f"Metadata warehouse write failed: {e}")
 
 
 # ── Feedback ──────────────────────────────────────────────────────────────────
@@ -273,7 +461,8 @@ async def sync_feedback_to_bigquery(row: FeedbackRow) -> None:
         return
     try:
         bq = _client()
-        table = bq.dataset(BQ_DATASET_ID).table(BQ_FEEDBACK_TABLE_ID)
+        ensure_tables(lambda *_a, **_k: None)
+        table = _tref(BQ_FEEDBACK_TABLE_ID)
         errors = bq.insert_rows_json(table, [{
             "submitted_at": date.today().isoformat(),
             "query": row.query, "vertical": row.vertical,

@@ -33,7 +33,11 @@ const PREVIEW_COLLAPSED = 5;
 
 // Vertical display order for the Step 1 filter chip row.
 // FFG is always first; client verticals follow alphabetically.
-const VERTICAL_ORDER = ["FFG", "Nonprofit", "Education", "Association", "Healthcare", "Community", "Faith", "Other"];
+// Chip order for Step 1. "Other" is deliberately absent: an unmapped domain
+// should be classified in backend/data/client_verticals.json or excluded in
+// excluded_domains.json, not given a catch-all bulk-select button. Unmapped
+// domains still appear in the grid and stay individually selectable.
+const VERTICAL_ORDER = ["FFG", "Nonprofit", "Education", "Association", "Healthcare", "Community", "Faith"];
 
 const FEEDBACK_VERTICALS = [
   "Nonprofit", "Healthcare", "Education", "Association", "Faith", "Community", "Others",
@@ -295,7 +299,7 @@ function VerticalChipGrid({
           >
             {/* Glyph carries the state without relying on color alone (a11y). */}
             <span className="chip-mark" aria-hidden="true">
-              {state === "all" ? "✓" : state === "partial" ? "–" : "+"}
+              {state === "all" ? "✓" : state === "partial" ? "~" : "+"}
             </span>
             {v}
             <span className="chip-count">{selN > 0 ? `${selN}/${group.length}` : group.length}</span>
@@ -491,11 +495,11 @@ export default function Wizard() {
 
         <Stepper step={step} />
 
-        {/* ── Step 1: Domain picker — flat grid + vertical selector chips (M8.1) ── */}
+        {/* Step 1: domain picker. Flat grid plus vertical selector chips. */}
         {step === 1 && (
           <div className="panel">
             <h2>Select domains</h2>
-            <p className="panel-sub">Choose the properties to analyze. FFG-owned domains are always at the top. Use the vertical chips to select or clear a whole group at once — nothing is hidden.</p>
+            <p className="panel-sub">Choose the properties to analyze. FFG-owned domains are listed first. The vertical chips select or clear a whole group at once.</p>
             {domainErr && <div className="notice error" style={{ marginBottom: 16 }}>{domainErr}</div>}
             <div className="row" style={{ marginBottom: 16 }}>
               <button className="tiny" onClick={() => pick("ffg")}>FFG only</button>
@@ -627,8 +631,8 @@ export default function Wizard() {
                         <th title="Rank">#</th>
                         <th title="Page URL">Page</th>
                         <th title="Which signal(s) matched the topic">Matched on</th>
-                        <th title="Topical relevance score (0–10)">Relevance</th>
-                        <th title="SEO strength score (0–10)">SEO</th>
+                        <th title="Topical relevance score, 0 to 10">Relevance</th>
+                        <th title="SEO strength score, 0 to 10">SEO</th>
                         <th title="Page category and content type">Type</th>
                       </tr>
                     </thead>

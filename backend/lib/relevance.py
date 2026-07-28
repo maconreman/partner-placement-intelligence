@@ -109,7 +109,7 @@ async def compute_relevance_scores(
             embs = await _post_embed([q_prefix + raw_topic] + negatives, 60)
         except HFAPIError as e:
             if "503" in str(e):
-                log("▸ System warming up — retrying in 15 seconds...")
+                log("The embedding model is warming up. Retrying in 15 seconds.")
                 await asyncio.sleep(15)
                 embs = await _post_embed([q_prefix + raw_topic] + negatives, 60)
             else:

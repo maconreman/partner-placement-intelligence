@@ -8,6 +8,11 @@ type SyncStatus = {
   bigquery: boolean;
   gsc_last_sync: string | null;
   meta_last_sync: string | null;
+  gsc_rows?: number;
+  meta_rows?: number;
+  gsc_table_exists?: boolean;
+  meta_table_exists?: boolean;
+  detail?: string | null;
   error?: string;
 };
 type LogLine = { text: string; kind: "log" | "error" | "done" };
@@ -39,8 +44,8 @@ function staleness(iso: string | null): "fresh" | "stale" | "unknown" {
 function StatusPanel({ sync, onRefresh }: { sync: SyncStatus | null; onRefresh: () => void }) {
   const rows = [
     { label: "BigQuery", value: sync ? (sync.bigquery ? "Configured" : "Not configured") : "…", ok: sync?.bigquery },
-    { label: "GSC last sync", value: sync ? formatDate(sync.gsc_last_sync) : "…", ok: sync ? staleness(sync.gsc_last_sync) === "fresh" : undefined },
-    { label: "Metadata last sync", value: sync ? formatDate(sync.meta_last_sync) : "…", ok: sync ? staleness(sync.meta_last_sync) !== "unknown" : undefined },
+    { label: "GSC last sync", value: sync ? (sync.gsc_last_sync ? `${formatDate(sync.gsc_last_sync)} (${(sync.gsc_rows ?? 0).toLocaleString()} rows)` : "Never") : "...", ok: sync ? staleness(sync.gsc_last_sync) === "fresh" : undefined },
+    { label: "Metadata last sync", value: sync ? (sync.meta_last_sync ? `${formatDate(sync.meta_last_sync)} (${(sync.meta_rows ?? 0).toLocaleString()} pages)` : "Never") : "...", ok: sync ? staleness(sync.meta_last_sync) !== "unknown" : undefined },
   ];
 
   return (

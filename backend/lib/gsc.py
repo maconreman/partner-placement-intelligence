@@ -59,7 +59,7 @@ async def list_gsc_properties(log: LogFn = print) -> dict:
             # D-S5: surface env/auth/network errors in the streaming console instead
             # of silently returning 0 domains (the proximate cause of the M3.5
             # "0 domains" bug when GOOGLE_CLIENT_ID was unloaded).
-            log(f"! {account}@ — GSC property list failed: {e}")
+            log(f"{account}: could not list GSC properties. {e}")
             props_by_account[account] = []
 
     _domain_account_map.clear()
@@ -213,7 +213,7 @@ async def fetch_all_domains(
                 if rows else "! Warehouse empty — fetching live from Search Console."
             )
         except Exception as e:
-            log(f"! BigQuery unavailable ({e}) — fetching live from Search Console.")
+            log(f"BigQuery is unavailable ({e}). Fetching live from Search Console.")
 
     return await _live_gsc_fetch(domains, start_date, end_date, log, on_domain_complete)
 
@@ -261,16 +261,16 @@ async def _live_gsc_fetch(
         try:
             probe = await _probe_domain(d, start_date, end_date)
             if not probe:
-                log(f"! {short} — No search data found for these dates.")
+                log(f"{short}: no search data for these dates.")
             elif len(probe) >= 25000:
-                log(f"▸ {short} — Reading high-volume history (this may take a moment)...")
+                log(f"{short}: reading high-volume history. This one takes longer.")
                 heavy_domains.append(d)
             else:
-                log(f"✓ {short} — Successfully scanned.")
+                log(f"{short}: scanned.")
                 live_frames[d] = probe
                 _notify(d, probe)  # M4 item 2: light domain done → enqueue for crawl
         except Exception as e:
-            log(f"! {short} — Error: {e}")
+            log(f"{short}: failed. {e}")
 
     await map_with_concurrency(domains, GSC_MAX_WORKERS, probe_one)
 
@@ -311,10 +311,10 @@ async def _live_gsc_fetch(
             short = d.replace("sc-domain:", "")
             lst = raw[d]
             if not lst:
-                log(f"! {short} — No search data found.")
+                log(f"{short}: no search data found.")
             else:
                 live_frames[d] = _aggregate_raw(lst)
-                log(f"✓ {short} — Successfully scanned.")
+                log(f"{short}: scanned.")
                 _notify(d, live_frames[d])  # M4 item 2: heavy domain done → enqueue
 
     final: list[GscRow] = []

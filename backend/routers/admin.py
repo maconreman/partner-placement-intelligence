@@ -18,6 +18,7 @@ Engineering notes:
     or Phase 2 never crashes the server process.
   - The manual streaming endpoints (/sync-gsc and /sync-metadata) are unchanged.
 """
+import os
 import json
 import asyncio
 from datetime import date, timedelta
@@ -108,7 +109,7 @@ async def sync_gsc(request: Request):
         )
 
     async def job(log):
-        log("▸ Starting GSC sync for all domains (live fetch — bypassing warehouse)...")
+        log("Starting GSC sync for all domains. Live fetch, bypassing the warehouse.")
         props = await list_gsc_properties()
         domains = props.get("ordered", FFG_OWNED_DOMAINS)
         start_date, end_date = _date_range()
@@ -127,7 +128,7 @@ async def sync_gsc(request: Request):
         if USE_BIGQUERY:
             await bq_mod.sync_to_bigquery(rows, log)
         else:
-            log("! BigQuery not configured — data not persisted. Set BQ_PROJECT_ID and BQ_DATASET_ID.")
+            log("BigQuery is not configured, so nothing was saved. Set BQ_PROJECT_ID and BQ_DATASET_ID.")
 
     return _stream(job)
 
@@ -146,7 +147,7 @@ async def sync_metadata(request: Request):
         log("▸ Starting metadata sync...")
 
         if not USE_BIGQUERY:
-            log("! BigQuery not configured — cannot run metadata sync. Set BQ_PROJECT_ID and BQ_DATASET_ID.")
+            log("BigQuery is not configured, so the metadata sync cannot run. Set BQ_PROJECT_ID and BQ_DATASET_ID.")
             return
 
         from ..lib.bigquery import fetch_from_bigquery
@@ -158,7 +159,7 @@ async def sync_metadata(request: Request):
         rows, _ = await fetch_from_bigquery(domains, start_date, end_date, log)
 
         if not rows:
-            log("! No rows in warehouse — run GSC sync first.")
+            log("The warehouse has no rows. Run the GSC sync first.")
             return
 
         log(f"▸ Aggregating {len(rows):,} GSC rows to unique pages...")
@@ -305,22 +306,129 @@ async def auto_sync(secret_key: str):
 
 @router.get("/status")
 async def status():
-    """Return last sync dates from BigQuery."""
+    """
+    Warehouse status for the admin card.
+
+    Returns row counts and a table_exists flag alongside the dates, because
+    "Never" has two very different causes. A missing table means the sync never
+    reached BigQuery at all, usually unset credentials or a service account
+    without Data Editor. An existing but empty table means the sync ran and
+    wrote nothing, which points at the GSC fetch instead.
+    """
     if not USE_BIGQUERY:
-        return {"bigquery": False, "gsc_last_sync": None, "meta_last_sync": None}
+        return {
+            "bigquery": False, "gsc_last_sync": None, "meta_last_sync": None,
+            "detail": "BigQuery is disabled. Set BQ_PROJECT_ID and BQ_DATASET_ID.",
+        }
     try:
-        from ..lib.bigquery import _client
-        bq = _client()
-
-        gsc_sql = f"SELECT MAX(date) as last_date FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}`"
-        meta_sql = f"SELECT MAX(snapshot_date) as last_date FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_META_TABLE_ID}`"
-
-        gsc_rows = list(bq.query(gsc_sql).result())
-        meta_rows = list(bq.query(meta_sql).result())
-
-        gsc_last = str(gsc_rows[0].last_date) if gsc_rows and gsc_rows[0].last_date else None
-        meta_last = str(meta_rows[0].last_date) if meta_rows and meta_rows[0].last_date else None
-
-        return {"bigquery": True, "gsc_last_sync": gsc_last, "meta_last_sync": meta_last}
+        from ..lib.bigquery import get_last_sync
+        info = get_last_sync()
+        detail = None
+        if not info["gsc_table_exists"]:
+            detail = (
+                f"Table {BQ_DATASET_ID}.{BQ_TABLE_ID} does not exist yet. "
+                "It is created on the first sync."
+            )
+        elif info["gsc_rows"] == 0:
+            detail = "The GSC table exists but is empty. The last sync wrote no rows."
+        return {"bigquery": True, "detail": detail, **info}
     except Exception as e:
-        return {"bigquery": True, "error": str(e), "gsc_last_sync": None, "meta_last_sync": None}
+        return {
+            "bigquery": True, "error": str(e),
+            "gsc_last_sync": None, "meta_last_sync": None,
+            "gsc_rows": 0, "meta_rows": 0,
+            "gsc_table_exists": False, "meta_table_exists": False,
+        }
+
+
+@router.get("/bq-check")
+async def bq_check():
+    """
+    Read-write diagnostic for the warehouse. Answers "why does it say Never" in
+    one request instead of a guessing sequence.
+
+    Reports, in order: which environment variables are set, whether credentials
+    parse, whether the dataset and tables exist or can be created, and whether a
+    single test row can be written to a dedicated probe partition and read back.
+    The probe writes to 1970-01-01 so it never touches a real snapshot, and it
+    truncates that partition each time so it cannot accumulate.
+    """
+    report: dict = {"steps": [], "ok": False}
+
+    def step(name: str, ok: bool, detail: str = "") -> None:
+        report["steps"].append({"step": name, "ok": ok, "detail": detail})
+
+    missing = [
+        k for k in ("BQ_PROJECT_ID", "BQ_DATASET_ID", "BQ_TABLE_ID")
+        if not os.environ.get(k)
+    ]
+    step("env vars set", not missing, f"missing: {', '.join(missing)}" if missing else "")
+    if missing:
+        report["hint"] = (
+            "On Hugging Face these are set in the Space under Settings, then "
+            "Variables and secrets. A local .env file is not used there."
+        )
+        return report
+
+    creds_raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    step(
+        "service account present", bool(creds_raw),
+        "empty, so the app will fall back to application default credentials, "
+        "which do not exist on Hugging Face" if not creds_raw else "",
+    )
+
+    try:
+        from ..lib.bigquery import _client, ensure_tables, _tref, _GSC_SCHEMA
+        from google.cloud import bigquery as bq_mod
+        bq = _client()
+        step("credentials parse and client builds", True)
+    except Exception as e:
+        step("credentials parse and client builds", False, str(e))
+        return report
+
+    try:
+        ensure_tables(lambda *_a, **_k: None)
+        step("dataset and tables exist or were created", True)
+    except Exception as e:
+        step("dataset and tables exist or were created", False, str(e))
+        report["hint"] = (
+            "Grant the service account the BigQuery Data Editor and BigQuery "
+            "Job User roles on the project."
+        )
+        return report
+
+    try:
+        probe_day = "1970-01-01"
+        target = (
+            f"{os.environ['BQ_PROJECT_ID']}.{os.environ['BQ_DATASET_ID']}."
+            f"{os.environ['BQ_TABLE_ID']}$19700101"
+        )
+        cfg = bq_mod.LoadJobConfig(
+            schema=_GSC_SCHEMA,
+            write_disposition=bq_mod.WriteDisposition.WRITE_TRUNCATE,
+            source_format=bq_mod.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        row = {
+            "account": "bq-check", "domain": "bq-check", "query": "bq-check",
+            "page": "bq-check", "clicks": 0, "impressions": 0, "position": 0.0,
+            "date": probe_day,
+        }
+        bq.load_table_from_json([row], target, job_config=cfg).result()
+        sql = (
+            f"SELECT COUNT(*) AS n FROM "
+            f"`{os.environ['BQ_PROJECT_ID']}.{os.environ['BQ_DATASET_ID']}."
+            f"{os.environ['BQ_TABLE_ID']}` WHERE date = DATE '1970-01-01'"
+        )
+        n = next(iter(bq.query(sql).result())).n
+        step("write and read back a probe row", int(n) == 1, f"rows found: {n}")
+        report["ok"] = int(n) == 1
+    except Exception as e:
+        step("write and read back a probe row", False, str(e))
+        return report
+
+    if report["ok"]:
+        report["hint"] = (
+            "The warehouse is writable. If the admin card still shows Never, "
+            "run a GSC sync and check the log for the row count it reports."
+        )
+    return report
