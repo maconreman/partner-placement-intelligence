@@ -35,6 +35,33 @@ M8.2 fixes, addressing "GSC last sync: Never" with an apparently successful sync
    form is deprecated in google-cloud-bigquery 3.x and raises on some versions.
 
 5. get_last_sync() backs the /admin status card, which is what renders "Never".
+
+M9.1 fix (D-M9-6) — the warehouse read must not apply a lag-adjusted upper bound:
+
+   fetch_from_bigquery() previously filtered `date BETWEEN @startDate AND
+   @endDate`. Callers build that window with _date_range(), where
+   end_date = today - GSC_LAG_DAYS. But sync_to_bigquery() stamps every
+   snapshot with THIS WEEK'S MONDAY. Early in the week the snapshot date is
+   newer than the reader's own end_date, so the row was discarded by the WHERE
+   clause before QUALIFY or the freshness check ever saw it.
+
+   Observed: a snapshot dated 2026-07-27 (Monday) with 25,000 rows for
+   sc-domain:fundly.com, read on Tuesday 2026-07-28 with end_date 2026-07-25.
+   COUNT(*) showed the rows; the read reported "Warehouse empty" and fell
+   through to a full live fetch. This recurs every week the sync lands inside
+   the lag window, which is most of them.
+
+   GSC_LAG_DAYS exists to stop us asking Google for data that has not settled.
+   That is a live-fetch concern and it stays in _live_gsc_fetch. It has no
+   meaning for a warehouse read, where "which rows do we want" is already
+   answered by QUALIFY date = MAX(date) OVER (PARTITION BY domain), and
+   "are they recent enough" is already answered by the freshness check below
+   the query. The upper bound was duplicating that job and getting it wrong.
+
+   The lower bound is kept: it prunes partitions (the table is DAY-partitioned
+   on `date`, so this is what keeps the read cheap) and it cannot exclude a
+   current snapshot, since this week's Monday is always newer than
+   today - 365 days.
 """
 from __future__ import annotations
 import os
@@ -243,6 +270,11 @@ async def fetch_from_bigquery(
     """
     Primary read. Returns (rows, fresh) where fresh=True when newest date >= this
     week's Monday. Callers fall through to live GSC fetch on empty or stale.
+
+    `end_date` is accepted for signature compatibility with the live-fetch
+    callers but is deliberately NOT used as an upper bound on `date` — see
+    D-M9-6 and the note in the module docstring. Applying it discarded the
+    current week's snapshot whenever the sync landed inside the GSC lag window.
     """
     bq = _client()
     # M8 fix: read only each domain's LATEST snapshot, never sum across
@@ -254,6 +286,18 @@ async def fetch_from_bigquery(
     # neither disappears nor drags the others). GROUP BY then collapses only
     # duplicate rows *within* one snapshot (e.g. a retried write) via MAX,
     # which is identity on identical duplicates — not SUM.
+    #
+    # M9.1 fix (D-M9-6): the upper bound `AND date <= @endDate` is GONE.
+    # Callers pass end_date = today - GSC_LAG_DAYS, while sync_to_bigquery()
+    # stamps snapshots with this week's Monday. Early in the week the snapshot
+    # is NEWER than end_date, so the WHERE clause dropped it before QUALIFY ran
+    # and the read reported an empty warehouse over a table that plainly had
+    # rows. Selecting the right snapshot is QUALIFY's job; judging whether it is
+    # recent enough is the freshness check below. Neither needs an upper bound.
+    #
+    # The lower bound stays: it prunes partitions on this DAY-partitioned table
+    # (keeping the read cheap) and can never exclude a live snapshot, because
+    # this week's Monday is always newer than today - 365 days.
     sql = f"""
         SELECT account, domain, query, page,
                MAX(clicks)       AS clicks,
@@ -264,7 +308,7 @@ async def fetch_from_bigquery(
             SELECT account, domain, query, page, clicks, impressions, position, date
             FROM {_table_ref()}
             WHERE domain IN UNNEST(@domains)
-              AND date BETWEEN @startDate AND @endDate
+              AND date >= @startDate
             QUALIFY date = MAX(date) OVER (PARTITION BY domain)
         )
         GROUP BY account, domain, query, page
@@ -273,7 +317,6 @@ async def fetch_from_bigquery(
         query_parameters=[
             bigquery.ArrayQueryParameter("domains", "STRING", domains),
             bigquery.ScalarQueryParameter("startDate", "DATE", start_date),
-            bigquery.ScalarQueryParameter("endDate", "DATE", end_date),
         ]
     )
     rows = list(bq.query(sql, job_config=job_config).result())
@@ -306,7 +349,7 @@ async def fetch_from_bigquery(
     oldest_domain_snapshot = min(domain_max.values()) if domain_max else ""
     fresh = bool(out and oldest_domain_snapshot and oldest_domain_snapshot >= _week_monday())
     if out:
-        log(f"✓ Warehouse has {len(out):,} rows (newest {max_date or 'n/a'}, {'fresh' if fresh else 'stale'}).")
+        log(f"Warehouse has {len(out):,} rows (newest {max_date or 'n/a'}, {'fresh' if fresh else 'stale'}).")
     return out, fresh
 
 
