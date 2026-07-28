@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { TopBar, NavAction } from "@/components/Brand";
+import { TopBar } from "@/components/Brand";
 
 type Domain = { siteUrl: string; short: string; isFfg: boolean; vertical?: string };
 type StageId = "fetch" | "pages" | "seo" | "metadata" | "match" | "refine" | "rank";
@@ -17,6 +17,10 @@ type PreviewRow = {
 };
 type ExportRow = Record<string, string | number>;
 
+// M9.3: contextual page action (New run / Back to domains). This lives with the
+// page title now, not in the global TopBar, so the type is page-owned too.
+type PageAction = { label: string; onClick: () => void; disabled?: boolean };
+
 const STAGES: { id: StageId; label: string }[] = [
   { id: "fetch", label: "Fetch" },
   { id: "pages", label: "Pages" },
@@ -29,9 +33,14 @@ const STAGES: { id: StageId; label: string }[] = [
 
 const WIZARD_STEPS = ["Domains", "Topic & dates", "Results"];
 const GSC_LAG_DAYS = 3;
-// M9.2: the Top 10 is always shown in full. The backend only ever sends 10
+// M9.3: the Top 10 is always shown in full. The backend only ever sends 10
 // preview rows (pipeline.py results[:10]); the fuller set lives in the export.
 const PREVIEW_TOP_N = 10;
+
+// M9.3: how long a stage must run before the app tells the user it is slow.
+// A warm-warehouse fetch and a fully cached metadata pass both finish inside
+// this window, so a fast run never shows a "please wait" note.
+const SLOW_STAGE_HINT_AFTER_SEC = 12;
 
 // Vertical display order for the Step 1 filter chip row.
 // FFG is always first; client verticals follow alphabetically.
@@ -54,8 +63,15 @@ function presetDates(): { start: string; end: string } {
   return { start: iso(start), end: iso(end) };
 }
 
-function scoreClass(v: number): string {
-  if (v >= 7) return "s-high";
+// M9.3: one duration formatter shared by the live timer and the final summary,
+// so "3m 12s" means the same thing in both places.
+function fmtDuration(totalSec: number): string {
+  const mm = Math.floor(totalSec / 60);
+  const ss = totalSec % 60;
+  return mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
+}
+
+function scoreClass(v: number): string {  if (v >= 7) return "s-high";
   if (v >= 4) return "s-mid";
   return "s-low";
 }
@@ -335,6 +351,9 @@ export default function Wizard() {
   const consoleRef = useRef<HTMLDivElement>(null);
   const runStartRef = useRef<number | null>(null);  // M9.2: wall-clock run start
   const [consoleOpen, setConsoleOpen] = useState(false);
+  // M9.3: when the current stage went active, used to delay the "this takes a
+  // while" notes so a fast warm-warehouse run never flashes them.
+  const [stageStartedAt, setStageStartedAt] = useState<number | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   // M9.2: frozen run metadata, captured when a run finishes, shown in Results.
   const [completedAt, setCompletedAt] = useState<Date | null>(null);
@@ -380,10 +399,7 @@ export default function Wizard() {
   useEffect(() => { if (running && elapsedSec === 90) setConsoleOpen(true); }, [elapsedSec, running]);
   useEffect(() => { if (running && stages.refine === "active") setConsoleOpen(true); }, [running, stages.refine]);
 
-  const elapsedLabel = (() => {
-    const mm = Math.floor(elapsedSec / 60), ss = elapsedSec % 60;
-    return mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
-  })();
+  const elapsedLabel = fmtDuration(elapsedSec);
 
   // M8.1: bulk add/remove used by the vertical chips. Operates on the same
   // `selected` set as individual checkbox clicks, so chip state and grid state
@@ -426,6 +442,7 @@ export default function Wizard() {
     setFormErr(""); setStep(3); setRunError(null); setExportUrl(""); setPreview([]); setExportRows([]);
     setFunnel(null); setLogLines([]); setExpanded(new Set());
     setCompletedAt(null); setRunDurationSec(null);
+    setStageStartedAt(null);
     runStartRef.current = Date.now();
     setStages({ fetch: "idle", pages: "idle", seo: "idle", metadata: "idle", match: "idle", refine: "idle", rank: "idle" });
     setElapsedSec(0);
@@ -448,7 +465,11 @@ export default function Wizard() {
   };
 
   function handleEvent(e: any) {
-    if (e.type === "stage") setStages((prev) => ({ ...prev, [e.stage]: e.status }));
+    if (e.type === "stage") {
+      setStages((prev) => ({ ...prev, [e.stage]: e.status }));
+      // M9.3: reset the per-stage clock each time a new stage starts.
+      if (e.status === "active") setStageStartedAt(Date.now());
+    }
     else if (e.type === "log") setLogLines((prev) => [...prev, e.message]);
     else if (e.type === "funnel") setFunnel(e);
     else if (e.type === "error") setRunError(e.message);
@@ -474,7 +495,9 @@ export default function Wizard() {
     } catch (e) { setRunError(e instanceof Error ? e.message : String(e)); } finally { setExporting(false); }
   };
 
-  const nav: NavAction | undefined =
+  // M9.3: contextual action for the current step. Rendered beside the page
+  // title, not in the global TopBar.
+  const nav: PageAction | undefined =
     step === 2 ? { label: "← Back to domains", onClick: () => setStep(1) }
     : step === 3 ? { label: "← New run", onClick: () => setStep(2), disabled: running }
     : undefined;
@@ -498,28 +521,52 @@ export default function Wizard() {
     );
   }
 
-  // M9.2: always the Top 10, no expand/collapse toggle.
+  // M9.3: the Top 10 is always shown, no expand/collapse toggle.
   const visible = preview.slice(0, PREVIEW_TOP_N);
-  const runCompletedLabel =
-    completedAt
-      ? `${completedAt.toLocaleString()} · ran in ${
-          runDurationSec != null
-            ? runDurationSec >= 60
-              ? `${Math.floor(runDurationSec / 60)}m ${runDurationSec % 60}s`
-              : `${runDurationSec}s`
-            : "n/a"
-        }`
-      : "";
+
+  // M9.3: run timing, formatted as short separate pieces instead of one long
+  // concatenated sentence. Duration reads "3m 12s"; the completion stamp reads
+  // "Completed 2:30 PM", using a compact local time rather than a full locale
+  // datetime string, which was too long to sit inline.
+  const runDurationLabel = runDurationSec != null ? fmtDuration(runDurationSec) : "";
+  const runSummary = completedAt
+    ? `Completed ${completedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+    : "";
+
   const activeStage = STAGES.find((s) => stages[s.id] === "active");
+
+  // M9.3: seconds spent in the CURRENT stage. Recomputed on every render, and
+  // the 1s elapsed-counter tick guarantees a render each second while running.
+  const stageElapsedSec =
+    running && stageStartedAt != null
+      ? Math.max(0, Math.round((Date.now() - stageStartedAt) / 1000))
+      : 0;
+  // Only hint that a stage is slow once it actually is. A warm-warehouse fetch
+  // or a fully cached metadata pass finishes well inside this window, so the
+  // note never appears on a fast run.
+  const showSlowHint = stageElapsedSec >= SLOW_STAGE_HINT_AFTER_SEC;
   const doneCount = STAGES.filter((s) => stages[s.id] === "done").length;
 
   return (
     <>
-      <TopBar connected={authReady === true} navAction={nav} />
+      <TopBar connected={authReady === true} />
       <div className="shell">
-        <div className="page-head">
-          <h1>Placement Intelligence</h1>
-          <p className="lead">Discover high-value content placement opportunities across the FFG network and client sites, ranked by topical relevance and SEO strength</p>
+        {/* M9.3: page title and its contextual action sit together. The global
+            header stays fixed site chrome on every page. */}
+        <div className="page-head page-head-row">
+          <div className="page-head-text">
+            <h1>Placement Intelligence</h1>
+            <p className="lead">Discover high-value content placement opportunities across the FFG network and client sites, ranked by topical relevance and SEO strength</p>
+          </div>
+          {nav && (
+            <button
+              className="ghost page-head-action"
+              onClick={nav.onClick}
+              disabled={nav.disabled}
+            >
+              {nav.label}
+            </button>
+          )}
         </div>
 
         <Stepper step={step} />
@@ -610,16 +657,23 @@ export default function Wizard() {
         {step === 3 && (
           <div className="panel">
             <div className="section-rule"><span>Progress</span></div>
-            {running && activeStage && (
+            {/* M9.3: the timer no longer waits for the first stage event. It
+                used to be gated on `activeStage`, which is undefined until the
+                backend emits its first stage, so the whole line (timer
+                included) was invisible during "Starting pipeline", which is
+                exactly when the user most wants to see it ticking. */}
+            {running && (
               <div className="run-status">
-                Running, stage {doneCount + 1} of {STAGES.length}, {activeStage.label}
+                {activeStage
+                  ? `Running, stage ${doneCount + 1} of ${STAGES.length}, ${activeStage.label}`
+                  : "Starting pipeline"}
                 <span className="run-elapsed">{elapsedLabel}</span>
               </div>
             )}
             {!running && !runError && preview.length > 0 && (
               <div className="run-status">
                 Complete, {preview.length} pages scored
-                {runCompletedLabel && <span className="run-completed">{runCompletedLabel}</span>}
+                {runDurationLabel && <span className="run-elapsed">{runDurationLabel}</span>}
               </div>
             )}
             <div className="tracker">
@@ -630,6 +684,26 @@ export default function Wizard() {
             {running && (
               <div className="progress-wrap" aria-hidden="true">
                 <div className="progress-bar" />
+              </div>
+            )}
+            {/* M9.3: tell the user when a stage is genuinely slow, so a long
+                wait reads as expected rather than as a hang. Each note appears
+                only after the stage has been running a while, so a fast
+                warm-cache run never shows one. */}
+            {running && stages.fetch === "active" && showSlowHint && (
+              <div className="patience-note">
+                Reading search data for every selected domain. If the warehouse
+                is warm this is quick. On a cold run it pulls a full year of
+                history one domain at a time and can take several minutes.
+                Please leave this tab open.
+              </div>
+            )}
+            {running && stages.metadata === "active" && showSlowHint && (
+              <div className="patience-note">
+                Reading page titles and headings. Pages already stored are
+                instant. Any page that has not been read before is fetched now,
+                which can take a few minutes on a large set. Please leave this
+                tab open.
               </div>
             )}
             {running && stages.refine === "active" && (
@@ -660,8 +734,11 @@ export default function Wizard() {
                   <span style={{ color: "var(--muted)", fontSize: 12.5 }}>
                     Top {visible.length} results
                   </span>
-                  {runCompletedLabel && (
-                    <span className="results-timestamp">{runCompletedLabel}</span>
+                  {runSummary && (
+                    <span className="results-timestamp">
+                      {runSummary}
+                      {runDurationLabel && <b> · {runDurationLabel}</b>}
+                    </span>
                   )}
                 </div>
 
