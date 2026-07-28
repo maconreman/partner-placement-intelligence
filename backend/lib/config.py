@@ -208,6 +208,31 @@ CATEGORY_VOCAB: dict[str, set[str]] = {
 LAYER2_MIN_VOCAB_HITS = 2
 PROGRAMMATIC_SERIES_MIN = 10
 
+# ── Non-placement exclusions (M9.2) ───────────────────────────────────────────
+# Pages that are never valid placements and must be dropped from the ranked
+# results entirely, no matter how they were categorized or how well they match.
+# This is the single authoritative list; quickmatch.py::quick_match_candidates
+# enforces it as the one choke point every result passes through before scoring.
+#
+# Two gates, because non-placements arrive two different ways:
+#   1. By category — pages classify.py assigned to a structural, non-content
+#      category. "Hub" was already excluded in quickmatch; Homepage and Contact
+#      are added here (a site's front door and its contact page are not
+#      placements). These are matched against PageRow.page_category.
+#   2. By URL — "Category" and "Tag" are NOT categories in this system; they are
+#      archive/taxonomy URLs (/category/..., /tag/...). classify.py never labels
+#      them, so they slip through as "Other" and can rank. They are excluded by
+#      matching the URL path instead. crawl.py already skips these for metadata
+#      via _SKIP_URL_PATTERNS; this makes "not crawled" and "not a placement"
+#      agree by driving the placement decision from a declared list here.
+NON_PLACEMENT_CATEGORIES: set[str] = {"Hub", "Homepage", "Contact"}
+
+# URL path fragments that mark an archive/taxonomy page rather than a placement.
+# Matched case-insensitively against the lowercased URL path.
+NON_PLACEMENT_URL_PATTERNS: tuple[str, ...] = (
+    "/category/", "/categories/", "/tag/", "/tags/",
+)
+
 _DOMAIN_GENERICS: set[str] = {
     "fundraising", "fundraise", "fundraiser", "fundraisers",
     "nonprofit", "nonprofits", "donation", "donations", "donate",
