@@ -11,6 +11,17 @@ M7 fixes:
     the chunk loop and pass it through, eliminating one Upstash round-trip + one
     blocking gapi_build() call per chunk (was 13+ redundant calls for a 12-month
     date range, the primary cause of 10+ minute heavy-domain fetches)
+
+M9.1 fix (D-M9-7): each domain is now written to BigQuery the moment its own
+fetch finishes, via sync_domain_to_bigquery() (delete-this-domain-for-this-date,
+then append). Previously the only warehouse write was one WRITE_TRUNCATE of the
+whole day partition at the end of the run. A partial or interrupted run then
+truncated the partition down to whatever it had reached, deleting every other
+domain's data — this is what wiped fundly.com and ngpvan.com on 2026-07-27,
+leaving only infinitegiving.com. Per-domain writes make a domain durable as soon
+as it is scanned and make a partial run incapable of touching domains it did not
+fetch. The end-of-run sync_to_bigquery() call is kept as a reconciliation pass
+that carries the complete result set.
 """
 from __future__ import annotations
 import asyncio
@@ -20,7 +31,7 @@ from typing import Optional, Callable
 from .config import FFG_OWNED_DOMAINS, GSC_ROW_LIMIT, GSC_MAX_WORKERS, USE_BIGQUERY
 from .util import GscRow, LogFn, map_with_concurrency
 from .googleauth import gsc_client
-from .bigquery import fetch_from_bigquery, sync_to_bigquery
+from .bigquery import fetch_from_bigquery, sync_to_bigquery, sync_domain_to_bigquery
 from .tokenstore import get_auth_status
 
 # M4 item 2: callback fired once per domain as its live GSC rows finish, so the
@@ -250,6 +261,19 @@ async def _live_gsc_fetch(
     heavy_domains: list[str] = []
 
     def _notify(domain: str, rows: list[GscRow]) -> None:
+        # M9.1 (D-M9-7): persist THIS domain to BigQuery the moment it finishes,
+        # scoped to its own rows so a partial run cannot delete other domains.
+        # Scheduled as a background task on the same event loop; a per-domain
+        # write failure is swallowed inside sync_domain_to_bigquery (best-effort)
+        # and the end-of-run reconciliation pass is the backstop. Guarded by
+        # USE_BIGQUERY so live-only deployments are unaffected.
+        if USE_BIGQUERY and rows:
+            try:
+                asyncio.create_task(sync_domain_to_bigquery(domain, rows, log))
+            except Exception:
+                pass  # never let the durable write break the fetch
+
+        # M4 item 2: metadata pre-warm overlap — unchanged.
         if on_domain_complete and rows:
             try:
                 on_domain_complete(domain, rows)
@@ -323,7 +347,16 @@ async def _live_gsc_fetch(
         final.extend(frame)
         freshly_fetched.extend(frame)
 
+    # M9.1 (D-M9-7): each domain was already written durably and independently
+    # as it finished, via sync_domain_to_bigquery() in _notify(). This final
+    # call is the RECONCILIATION pass — it rebuilds the whole partition from the
+    # complete result set as a consistency backstop. It is only safe because
+    # freshly_fetched here is the COMPLETE set for this run; never call
+    # sync_to_bigquery with a partial set (that is the failure mode that caused
+    # the 2026-07-27 data loss). Any in-flight per-domain background writes are
+    # allowed to settle first so the reconciliation does not race them.
     if USE_BIGQUERY and freshly_fetched:
+        await asyncio.sleep(0)  # let scheduled per-domain write tasks start
         await sync_to_bigquery(freshly_fetched, log)
 
     return final
