@@ -41,16 +41,43 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
 
       - name: Install backend dependencies
         run: pip install -r backend/requirements.txt
+
+      - name: Confirm required secrets are present (no values printed)
+        run: |
+          missing=""
+          for name in GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET APP_BASE_URL \
+                      UPSTASH_REDIS_REST_URL UPSTASH_REDIS_REST_TOKEN \
+                      BQ_PROJECT_ID BQ_DATASET_ID GCP_SERVICE_ACCOUNT_JSON; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing required Actions secrets:$missing"
+            echo "Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "All required secrets are present."
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          BQ_PROJECT_ID: ${{ secrets.BQ_PROJECT_ID }}
+          BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
 
       - name: Run warehouse sync
         env:
@@ -78,7 +105,12 @@ jobs:
           # strictly needed for a fetch+crawl sync, but harmless to provide.
           HF_API_TOKEN: ${{ secrets.HF_API_TOKEN }}
 
-          # Optional concurrency override. Leave unset to use the default of 16.
-          GSC_MAX_WORKERS: ${{ vars.GSC_MAX_WORKERS }}
+          # Optional concurrency override. `vars.GSC_MAX_WORKERS` is an empty
+          # string (not unset) when the repo variable was never created, and
+          # config.py does int(os.environ.get("GSC_MAX_WORKERS", "16")) — an
+          # empty string here raises ValueError and crashes the job before any
+          # fetch happens. The `||` falls back to 16 only when the variable is
+          # genuinely empty/unset, matching config.py's own default.
+          GSC_MAX_WORKERS: ${{ vars.GSC_MAX_WORKERS || '16' }}
         run: |
           python -m jobs.sync --phase "${{ github.event.inputs.phase || 'all' }}"
