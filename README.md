@@ -8,10 +8,10 @@ app_port: 7860
 pinned: false
 ---
 
-# Nexus Placement Intelligence — Alpha M7
+# Nexus Placement Intelligence — Alpha M9
 
 Single-deployment FastAPI + Next.js app that scores content-placement opportunities
-across the FFG network. **M7** migrates the production stack to Hugging Face Spaces
+across the FFG network. **M9** migrates the production stack to Hugging Face Spaces
 (Docker), replaces the old Basic Auth popup with a styled username/password gate,
 hardens the BigQuery write path so GSC data actually persists, and ships a UI
 refresh with a dark/light toggle. It builds on M4's single-app consolidation and
@@ -30,7 +30,7 @@ nexus-placement-intelligence/
 └── .env.example
 ```
 
-See `M7_CHANGES.md` for exactly what changed and why, and `DECISIONS.md` for the
+See `M9_CHANGES.md` for exactly what changed and why, and `DECISIONS.md` for the
 binding rule set.
 
 ---
