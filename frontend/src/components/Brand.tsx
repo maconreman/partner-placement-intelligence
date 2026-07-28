@@ -95,6 +95,14 @@ export function TopBar({
           </div>
         </a>
         <div className="topbar-spacer" />
+        {/* M9.2: attribution shown in the app UI. */}
+        <a
+          className="topbar-attribution"
+          href="mailto:macon.reman@nexusmarketing.com"
+          title="Maintained by Macon Reman"
+        >
+          macon.reman@nexusmarketing.com
+        </a>
         {navAction && (
           <button className="ghost tiny" onClick={navAction.onClick} disabled={navAction.disabled}>
             {navAction.label}
