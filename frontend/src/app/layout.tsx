@@ -22,14 +22,18 @@ export const metadata: Metadata = {
   description: "Topical and SEO placement recommendations across FFG and client domains.",
 };
 
+// M9.2 (amends D-M7-3): the default theme is now dark. Light mode stays fully
+// supported and is applied only when the user has explicitly saved "light".
+// Any other stored value, or no stored value at all, resolves to dark. The
+// script still runs before paint so there is no flash of the wrong theme.
 const THEME_INIT_SCRIPT = `
 (function () {
   try {
     var saved = localStorage.getItem("ffg-theme");
-    var theme = saved === "dark" ? "dark" : "light";
+    var theme = saved === "light" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", theme);
   } catch (e) {
-    document.documentElement.setAttribute("data-theme", "light");
+    document.documentElement.setAttribute("data-theme", "dark");
   }
 })();
 `;
