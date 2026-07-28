@@ -374,6 +374,15 @@ async def sync_to_bigquery(rows: list[GscRow], log: LogFn = print) -> None:
 
     Best-effort unless BQ_STRICT_WRITES is set, in which case failures raise so
     they surface during testing instead of being swallowed.
+
+    M9.1 role change: this is now the END-OF-RUN RECONCILIATION pass. Each domain
+    is written durably and independently by sync_domain_to_bigquery() the moment
+    it finishes (D-M9-7), so by the time this runs the partition is already
+    populated. This call rebuilds the whole partition from the run's complete
+    result set as a consistency backstop. It is only safe BECAUSE it carries the
+    complete set at end of run; do NOT call it with a partial set (that is the
+    exact mistake that caused the infinitegiving.com data loss — see
+    sync_domain_to_bigquery).
     """
     if not rows:
         log("No rows to write, skipping warehouse write.")
@@ -424,6 +433,98 @@ async def sync_to_bigquery(rows: list[GscRow], log: LogFn = print) -> None:
         if BQ_STRICT_WRITES:
             raise
         log(f"Warehouse write failed: {e}")
+
+
+async def sync_domain_to_bigquery(
+    domain: str, rows: list[GscRow], log: LogFn = print
+) -> None:
+    """
+    Write ONE domain's weekly snapshot, replacing only that domain's own rows
+    for this week's Monday. Every other domain in the same partition is left
+    untouched (D-M9-7).
+
+    Why this exists. sync_to_bigquery() does WRITE_TRUNCATE on the whole day
+    partition (table$YYYYMMDD), which replaces every domain's rows for that
+    date, not just the ones in the current call. That is safe only when the
+    caller always carries the COMPLETE domain set. A partial or interrupted run
+    breaks that assumption: on 2026-07-27 a run that reached only
+    infinitegiving.com truncated the entire partition down to that one domain,
+    destroying fundly.com, ngpvan.com and the rest. This function makes each
+    domain's write independent, so a partial run can only ever affect the
+    domains it actually finished.
+
+    Your rule, implemented literally: if a domain is missing, this appends it;
+    the only thing deleted is that same domain's own prior snapshot for this
+    date ("its old rows"). No other domain's data is ever deleted.
+
+    Mechanism. DELETE the domain's rows for this Monday, then APPEND via a load
+    job. The DELETE is safe and immediate because this table is populated by
+    load jobs, not streaming inserts. The streaming write-buffer that made
+    deletes fail for up to 90 minutes (the M8 finding) does not apply to a
+    load-job table, so delete-then-append is race-free here.
+
+    Idempotent by construction: re-running the same domain deletes its previous
+    rows first, so a retry or double-trigger never accumulates duplicates.
+
+    Best-effort unless BQ_STRICT_WRITES is set. Never raises in production so one
+    domain's write failure cannot abort a multi-domain run; the end-of-run
+    sync_to_bigquery() reconciliation pass is the safety net.
+    """
+    if not rows:
+        return
+    try:
+        ensure_tables(log)
+        bq = _client()
+        monday = date.fromisoformat(_week_monday())
+
+        # Delete only THIS domain's rows for THIS snapshot date. Parameterized on
+        # a native datetime.date (D11 applies to query parameters — this is a
+        # query parameter, not a load-job payload value).
+        delete_sql = (
+            f"DELETE FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}` "
+            "WHERE domain = @domain AND date = @snapshotDate"
+        )
+        delete_cfg = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("domain", "STRING", domain),
+                bigquery.ScalarQueryParameter("snapshotDate", "DATE", monday),
+            ]
+        )
+        bq.query(delete_sql, job_config=delete_cfg).result()
+
+        # Append this domain's fresh rows. WRITE_APPEND, not WRITE_TRUNCATE, and
+        # no partition decorator — the delete above already cleared this domain's
+        # slice, and a decorator truncate would wipe the other domains we just
+        # protected. The date value is an ISO string (load-job rule, D-M8-2).
+        payload = [
+            {
+                "account": r.account, "domain": r.domain, "query": r.query,
+                "page": r.page, "clicks": r.clicks, "impressions": r.impressions,
+                "position": r.position, "date": monday.isoformat(),
+            }
+            for r in rows
+        ]
+        job_config = bigquery.LoadJobConfig(
+            schema=_GSC_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        job = bq.load_table_from_json(
+            payload,
+            f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}",
+            job_config=job_config,
+        )
+        job.result()
+        if job.errors:
+            raise RuntimeError(f"Per-domain load job reported errors: {job.errors[:2]}")
+
+        short = domain.replace("sc-domain:", "")
+        log(f"Saved {len(rows):,} rows for {short} (snapshot {monday}).")
+    except Exception as e:
+        if BQ_STRICT_WRITES:
+            raise
+        short = domain.replace("sc-domain:", "")
+        log(f"Per-domain warehouse write failed for {short}: {e}")
 
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
