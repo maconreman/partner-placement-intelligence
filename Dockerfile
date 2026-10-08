@@ -13,9 +13,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Model cache lives inside /app so the non-root user can read it
+ENV HF_HOME=/app/.cache/huggingface
+
 # Install Python deps
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# M9.4: bake the embedding model into the image at build time, so a restart
+# never downloads it and no Inference credits are used at run time.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-base-en-v1.5', device='cpu')"
+ENV HF_HUB_OFFLINE=1
 
 # Copy backend
 COPY backend/ ./backend/
