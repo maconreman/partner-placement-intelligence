@@ -1,21 +1,28 @@
 """
-relevance.py — HF bi-encoder relevance scoring. Port of relevance.ts.
+relevance.py — bi-encoder relevance scoring. Port of relevance.ts.
 D1: NO TF-IDF fallback. HFAPIError is raised on any failure.
+M9.4 (D-M9-19): embeddings run locally inside the Space with
+sentence-transformers (same model, BAAI/bge-base-en-v1.5, same pooling and
+normalisation as the HF Inference feature-extraction endpoint), so scoring
+no longer spends Inference Provider credits. The HTTP router call is gone.
+The name HFAPIError is kept so pipeline.py needs no change.
 """
 from __future__ import annotations
 import asyncio
 import re
-import httpx
-from typing import Optional
+import threading
+from typing import Any, Optional
 
 from .config import (
-    HF_API_TOKEN, HF_EMBED_MODEL, HARD_NEGATIVES, _DRIFT_NEGATIVES,
+    HF_EMBED_MODEL, HARD_NEGATIVES, _DRIFT_NEGATIVES,
     CONTRASTIVE_WEIGHT, NLP_BATCH_SIZE, NLP_EMBED_WORKERS,
     RELEVANCE_MIN_THRESHOLD, QUERY_ONLY_MIN_THRESHOLD, SCORE_MIN, SCORE_MAX,
 )
 from .util import CandidateRow, LogFn, l2normalize, cosine_to_query, clamp_round1, map_with_concurrency
 
-EMBED_URL = f"https://router.huggingface.co/hf-inference/models/{HF_EMBED_MODEL}/pipeline/feature-extraction"
+# Texts per forward pass on CPU. Independent of NLP_BATCH_SIZE (which only
+# controls how the corpus is chunked before it reaches _post_embed).
+LOCAL_ENCODE_BATCH = 32
 
 GENERIC_TOKENS = {
     "software", "platform", "platforms", "tool", "tools", "service", "services",
@@ -29,22 +36,50 @@ class HFAPIError(Exception):
     pass
 
 
-async def _post_embed(texts: list[str], timeout_s: float) -> list[list[float]]:
-    if not HF_API_TOKEN or not HF_API_TOKEN.startswith("hf_"):
-        raise HFAPIError("HF_API_TOKEN is missing or invalid.")
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.post(
-            EMBED_URL,
-            headers={"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"},
-            json={"inputs": texts},
+# ── Local model (loaded once per process, shared by all users) ────────────────
+_model: Optional[Any] = None
+# One lock guards both the lazy load and encode(): torch already uses every
+# CPU core per call, so concurrent encodes from several users would only
+# thrash. Requests queue here instead; results are identical.
+_model_lock = threading.Lock()
+
+
+def _model_loaded() -> bool:
+    return _model is not None
+
+
+def _get_model() -> Any:
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer  # heavy import, deferred
+        _model = SentenceTransformer(HF_EMBED_MODEL, device="cpu")
+    return _model
+
+
+def _encode_sync(texts: list[str]) -> list[list[float]]:
+    with _model_lock:
+        model = _get_model()
+        vecs = model.encode(
+            texts,
+            batch_size=LOCAL_ENCODE_BATCH,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
         )
-        if resp.status_code != 200:
-            body = resp.text[:200]
-            raise HFAPIError(f"Embedding returned HTTP {resp.status_code}: {body}")
-        return resp.json()
+    return vecs.tolist()
+
+
+async def _post_embed(texts: list[str], timeout_s: float) -> list[list[float]]:
+    """Same signature as the old HTTP version. timeout_s is kept for
+    compatibility; local inference is not cancelled mid-batch."""
+    try:
+        return await asyncio.to_thread(_encode_sync, texts)
+    except Exception as exc:
+        raise HFAPIError(f"Local embedding failed: {exc}") from exc
 
 
 async def warmup_embed_model() -> None:
+    """Loads the model off the event loop so the first scoring run is fast."""
     try:
         await _post_embed(["warmup"], 30)
     except Exception:
@@ -79,9 +114,6 @@ async def compute_relevance_scores(
 ) -> list[float]:
     if not rows:
         return []
-    if not HF_API_TOKEN or not HF_API_TOKEN.startswith("hf_"):
-        raise HFAPIError("HF_API_TOKEN is missing or invalid.")
-
     corpus = _build_nlp_corpus(rows, raw_topic)
 
     # ── Dynamic collision check (D9-adjacent) ─────────────────────────────────
@@ -105,15 +137,9 @@ async def compute_relevance_scores(
     # ── Contrastive query embedding ───────────────────────────────────────────
     try:
         q_prefix = "Represent this sentence for searching relevant passages: "
-        try:
-            embs = await _post_embed([q_prefix + raw_topic] + negatives, 60)
-        except HFAPIError as e:
-            if "503" in str(e):
-                log("The embedding model is warming up. Retrying in 15 seconds.")
-                await asyncio.sleep(15)
-                embs = await _post_embed([q_prefix + raw_topic] + negatives, 60)
-            else:
-                raise
+        if not _model_loaded():
+            log("Loading the embedding model (first run after a restart takes ~20 seconds).")
+        embs = await _post_embed([q_prefix + raw_topic] + negatives, 60)
 
         dim = len(embs[0])
         neg_mean = [0.0] * dim
