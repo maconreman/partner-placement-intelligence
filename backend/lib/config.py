@@ -19,15 +19,24 @@ GSC_ACCOUNT_EMAILS: dict[str, str] = {
 }
 
 FFG_OWNED_DOMAINS: list[str] = [
-    "sc-domain:doublethedonation.com", "sc-domain:ecardwidget.com",
-    "sc-domain:npoinfo.com", "sc-domain:360matchpro.com",
-    "sc-domain:nonprofitssource.com", "sc-domain:recharity.ca",
-    "sc-domain:fundraisingip.com", "sc-domain:topnonprofits.com",
-    "sc-domain:crowd101.com", "sc-domain:kwala.co",
-    "sc-domain:nxunite.com", "sc-domain:schoolmoney.org",
-    "sc-domain:bestfundraisingideas.com", "sc-domain:gettingattention.org",
-    "sc-domain:workplacegiving.org", "sc-domain:fullerfocus.io",
+    "sc-domain:doublethedonation.com", 
+    "sc-domain:360matchpro.com",
+    "sc-domain:bestfundraisingideas.com",
+    "sc-domain:crowd101.com",
+    "sc-domain:ecardwidget.com",
+    "sc-domain:fullerfocus.io",
+    "sc-domain:fundraisingip.com",
+    "sc-domain:gettingattention.org",
     "sc-domain:hepdata.com",
+    "sc-domain:kwala.co",
+    "sc-domain:matchinggifts.com",
+    "sc-domain:nonprofitssource.com",
+    "sc-domain:npoinfo.com",
+    "sc-domain:nxunite.com",
+    "sc-domain:recharity.ca",
+    "sc-domain:schoolmoney.org",
+    "sc-domain:topnonprofits.com",
+    "sc-domain:workplacegiving.org"
 ]
 
 # ── Ops-editable data files (M8.1) ────────────────────────────────────────────
