@@ -48,7 +48,7 @@ const SLOW_STAGE_HINT_AFTER_SEC = 12;
 // should be classified in backend/data/client_verticals.json or excluded in
 // excluded_domains.json, not given a catch-all bulk-select button. Unmapped
 // domains still appear in the grid and stay individually selectable.
-const VERTICAL_ORDER = ["FFG", "Nonprofit", "Education", "Association", "Healthcare", "Community", "Faith"];
+const VERTICAL_ORDER = ["FFG", "Nonprofit", "Education", "Association", "Healthcare", "Community", "Faith", "Churned"];
 
 const FEEDBACK_VERTICALS = [
   "Nonprofit", "Healthcare", "Education", "Association", "Faith", "Community", "Others",
