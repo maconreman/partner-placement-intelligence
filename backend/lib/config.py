@@ -26,6 +26,8 @@ FFG_OWNED_DOMAINS: list[str] = [
     "sc-domain:crowd101.com", "sc-domain:kwala.co",
     "sc-domain:nxunite.com", "sc-domain:schoolmoney.org",
     "sc-domain:bestfundraisingideas.com", "sc-domain:gettingattention.org",
+    "sc-domain:workplacegiving.org", "sc-domain:fullerfocus.io",
+    "sc-domain:hepdata.com",
 ]
 
 # ── Ops-editable data files (M8.1) ────────────────────────────────────────────
