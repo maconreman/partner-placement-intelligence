@@ -36,7 +36,7 @@ FFG_OWNED_DOMAINS: list[str] = [
     "sc-domain:recharity.ca",
     "sc-domain:schoolmoney.org",
     "sc-domain:topnonprofits.com",
-    "sc-domain:workplacegiving.org"
+    "sc-domain:workplacegiving.org",
 ]
 
 # ── Ops-editable data files (M8.1) ────────────────────────────────────────────
