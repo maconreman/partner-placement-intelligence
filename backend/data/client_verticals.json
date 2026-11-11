@@ -30,7 +30,6 @@
     "meyerpartners.com",
     "mogli.com",
     "omnially.com",
-    "onecause.com",
     "orrgroup.com",
     "pursuant.com",
     "sneakers4funds.com",
@@ -85,6 +84,9 @@
   "Faith": [
     "shulware.com",
     "wonderink.org"
+  ],
+  "Placement Ineligible": [
+    "onecause.com"
   ],
   "Churned": [
     "32auctions.com",
